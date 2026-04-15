@@ -19,7 +19,7 @@ from .runner import RunManager
 
 app = FastAPI(title="Wanxiang Server", version="0.1.0")
 run_manager = RunManager(llm_mode=os.getenv("WANXIANG_LLM_MODE"))
-UI_FILE = Path(__file__).resolve().parents[3] / "wanxiang-ui.jsx"
+UI_FILE = Path(__file__).resolve().parents[2] / "wanxiang-ui.jsx"
 
 app.add_middleware(
     CORSMiddleware,

@@ -27,8 +27,8 @@ node_modules/
 npm-debug.log*
 
 # Runtime data (LLM outputs, run traces)
-agentforge/data/runs.jsonl
-agentforge/data/*.log
+data/runs.jsonl
+data/*.log
 
 # IDE / editor
 .vscode/
