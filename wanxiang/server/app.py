@@ -188,7 +188,25 @@ def main() -> None:
     parser.add_argument("--host", default=os.getenv("WANXIANG_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("WANXIANG_PORT", "8000")))
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload (development only).")
+    parser.add_argument(
+        "--log-level",
+        default=os.getenv("WANXIANG_LOG_LEVEL", "INFO"),
+        help="Log level for wanxiang.* loggers (default: INFO).",
+    )
     args = parser.parse_args()
+
+    # Route wanxiang.* logger output through uvicorn's handlers so lifespan
+    # logs (MCP registration, etc.) are visible on the server console.
+    level = getattr(logging, args.log_level.upper(), logging.INFO)
+    wanxiang_logger = logging.getLogger("wanxiang")
+    wanxiang_logger.setLevel(level)
+    if not wanxiang_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        wanxiang_logger.addHandler(handler)
+        wanxiang_logger.propagate = False
 
     uvicorn.run(
         "wanxiang.server.app:app",

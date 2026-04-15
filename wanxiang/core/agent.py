@@ -825,6 +825,24 @@ class BaseAgent:
                 writer_peer = peer
                 break
 
+        # Fallback: Director often names the producer agent things like
+        # "analyzer" / "researcher" / "summarizer" that don't match the
+        # writer-keyword heuristic. In a review_loop the producer is always
+        # the first agent in execution_order — use it as the effective peer
+        # so reviewer still receives tool-aware evaluation rules.
+        if writer_peer is None:
+            execution_order = team_context.get("execution_order")
+            if isinstance(execution_order, list) and execution_order:
+                producer_name = str(execution_order[0]).strip()
+                if producer_name and producer_name != self.config.name:
+                    for peer in peers:
+                        if (
+                            isinstance(peer, dict)
+                            and str(peer.get("name", "")).strip() == producer_name
+                        ):
+                            writer_peer = peer
+                            break
+
         if writer_peer is None:
             return ""
 
@@ -883,8 +901,23 @@ class BaseAgent:
 
         if has_any_registry_tool:
             lines.append(
-                f"- Writer may also use registry tools: {allowed_tools}. "
+                f"- Writer has registry tools available: {allowed_tools}. "
                 "If the task naturally fits these tools and they were not used, flag it."
+            )
+            lines.append(
+                "- Writer's knowledge in this run is BOUNDED by what those registry "
+                "tools can surface (e.g. read_text_file only returns what the file "
+                "contains). Evaluate the draft on faithfulness to that source "
+                "material, structural clarity, and balanced coverage. Do NOT "
+                "demand details outside the source's scope — API specs, protocols, "
+                "failure modes, scaling numbers, code snippets, etc. — unless the "
+                "source itself contains them."
+            )
+            lines.append(
+                "- If the draft explicitly notes which aspects are absent from the "
+                "source material (e.g. a 'Limitations' or 'Scope' section), treat "
+                "that as proper scoping, NOT a weakness. Return SUCCESS once the "
+                "draft accurately reflects the source and is internally coherent."
             )
 
         return "\n".join(lines)

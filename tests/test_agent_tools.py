@@ -463,6 +463,86 @@ def test_reviewer_prompt_requires_citations_when_writer_has_web_search_in_api_mo
     assert "REQUIRE at least one cited source" in body
 
 
+def test_reviewer_falls_back_to_execution_order_when_producer_name_is_nonwriter() -> None:
+    """Director often names producer 'analyzer' / 'researcher' — reviewer must still get
+    the tool-aware block via execution_order[0] fallback."""
+    config = AgentConfig(
+        name="reviewer",
+        description="Quality gate reviewer",
+        base_identity="You are a reviewer agent.",
+        team_context={
+            "effective_mode": "api",
+            "execution_order": ["analyzer", "reviewer"],
+            "agents": [
+                {
+                    "name": "analyzer",
+                    "duty": "read source file and summarize",
+                    "base_identity": "You are an analyzer.",
+                    "allowed_tools": ["read_text_file"],
+                    "native_tools": [],
+                },
+                {
+                    "name": "reviewer",
+                    "duty": "quality review",
+                    "base_identity": "You are a reviewer.",
+                    "allowed_tools": [],
+                    "native_tools": [],
+                },
+            ],
+        },
+    )
+    agent = BaseAgent(config=config, tool_registry=_build_registry())
+    message = Message(intent="review draft", content="draft body", sender="analyzer")
+
+    prompt = agent.build_prompt(message, persona="strict")
+    body = str(prompt[0].get("content", ""))
+
+    # Capability block must be present even though no peer matched writer keywords.
+    assert "Team tool availability:" in body
+    assert "name=analyzer" in body
+    # Source-bounded rule must appear because analyzer has registry tools.
+    assert "BOUNDED by what those registry tools" in body
+    assert "Do NOT demand details outside the source's scope" in body
+
+
+def test_reviewer_prompt_source_bounded_rule_present_when_writer_has_registry_tools() -> None:
+    config = AgentConfig(
+        name="reviewer",
+        description="Quality gate reviewer",
+        base_identity="You are a reviewer agent.",
+        team_context={
+            "effective_mode": "api",
+            "execution_order": ["writer", "reviewer"],
+            "agents": [
+                {
+                    "name": "writer",
+                    "duty": "read and summarize",
+                    "base_identity": "You are a writer.",
+                    "allowed_tools": ["read_text_file"],
+                    "native_tools": [],
+                },
+                {
+                    "name": "reviewer",
+                    "duty": "quality review",
+                    "base_identity": "You are a reviewer.",
+                    "allowed_tools": [],
+                    "native_tools": [],
+                },
+            ],
+        },
+    )
+    agent = BaseAgent(config=config, tool_registry=_build_registry())
+    message = Message(intent="review", content="draft", sender="writer")
+
+    prompt = agent.build_prompt(message, persona="strict")
+    body = str(prompt[0].get("content", ""))
+
+    assert "BOUNDED by what those registry tools" in body
+    assert "faithfulness to that source material" in body
+    # Writer has NO web_search here, so citation-required rule must NOT appear.
+    assert "REQUIRE at least one cited source" not in body
+
+
 def test_reviewer_prompt_without_team_context_keeps_legacy_rules() -> None:
     config = AgentConfig(
         name="reviewer",
