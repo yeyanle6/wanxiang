@@ -30,6 +30,9 @@ npm-debug.log*
 data/runs.jsonl
 data/*.log
 
+# Local MCP configuration (keep .example in git, ignore the real one)
+configs/mcp.yaml
+
 # IDE / editor
 .vscode/
 .idea/

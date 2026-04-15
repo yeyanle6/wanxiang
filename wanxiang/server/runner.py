@@ -31,11 +31,24 @@ class _RunState:
 
 
 class RunManager:
-    def __init__(self, factory: AgentFactory | None = None, llm_mode: str | None = None) -> None:
-        self.factory = factory or AgentFactory(
-            tool_registry=create_default_registry(),
-            llm_mode=llm_mode,
-        )
+    def __init__(
+        self,
+        factory: AgentFactory | None = None,
+        llm_mode: str | None = None,
+        tool_registry: Any = None,
+    ) -> None:
+        if factory is not None:
+            self.factory = factory
+        else:
+            registry = (
+                tool_registry
+                if tool_registry is not None
+                else create_default_registry()
+            )
+            self.factory = AgentFactory(
+                tool_registry=registry,
+                llm_mode=llm_mode,
+            )
         self._runs: dict[str, _RunState] = {}
         self._lock = asyncio.Lock()
         self._persist_lock = asyncio.Lock()

@@ -1,0 +1,35 @@
+# Wanxiang MCP server configuration.
+#
+# Copy this file to `configs/mcp.yaml` and edit. Wanxiang will spawn each
+# listed server as a subprocess at web-server startup and register its
+# tools into the global ToolRegistry. The actual mcp.yaml is gitignored
+# so local paths and credentials never land in git.
+#
+# Prerequisites for the filesystem example below:
+#   mkdir -p /tmp/wanxiang-test
+#   echo "Hello Wanxiang" > /tmp/wanxiang-test/demo.txt
+#   # npx fetches the server package on first run.
+
+servers:
+  # Filesystem — reads/writes under a sandboxed root directory.
+  - name: filesystem
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-filesystem"
+      - "/tmp/wanxiang-test"
+    timeout_s: 30
+    # Optional: set a prefix if multiple servers publish tools with the
+    # same name (prefix becomes "fs.read_file" etc.). Empty = raw names
+    # pass through directly to Claude tool_use.
+    # prefix: ""
+    # Optional: restrict visibility to specific agents (not enforced yet).
+    # allowed_agents: ["researcher"]
+
+  # Example: a second server (uncomment to enable).
+  # - name: memory
+  #   command: npx
+  #   args:
+  #     - "-y"
+  #     - "@modelcontextprotocol/server-memory"
+  #   timeout_s: 30
