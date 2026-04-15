@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from wanxiang.core.tools import ToolRegistry, ToolSpec
 
 
@@ -294,6 +296,220 @@ def test_empty_schema_accepts_any_arguments() -> None:
 
     # With no schema constraints, arguments flow through.
     assert asyncio.run(registry.execute("wide_open", {})).success is True
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Output Guard — UTF-8-safe truncation + annotation.
+# ---------------------------------------------------------------------------
+
+
+def test_output_under_limit_is_passed_through_unchanged() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="short",
+            description="Short output",
+            input_schema={"type": "object", "properties": {}, "required": []},
+            handler=lambda: "hi",
+            timeout_s=1.0,
+            max_output_bytes=1_000,
+        )
+    )
+    result = asyncio.run(registry.execute("short", {}))
+    assert result.success is True
+    assert result.content == "hi"
+    assert result.truncated is False
+    assert result.output_bytes == len("hi".encode("utf-8"))
+
+
+def test_output_over_limit_is_truncated_with_annotation() -> None:
+    big = "A" * 200  # 200 ASCII bytes
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="big_tool",
+            description="Returns big output",
+            input_schema={"type": "object", "properties": {}, "required": []},
+            handler=lambda: big,
+            timeout_s=1.0,
+            max_output_bytes=50,
+        )
+    )
+    result = asyncio.run(registry.execute("big_tool", {}))
+    assert result.success is True
+    assert result.truncated is True
+    assert "Output truncated" in result.content
+    assert "200 bytes" in result.content
+    assert "50 bytes" in result.content
+    # Content still starts with the original data.
+    assert result.content.startswith("A" * 50)
+
+
+def test_truncation_does_not_split_multibyte_utf8_characters() -> None:
+    # 中文每个字符 3 bytes. 30 chars = 90 bytes. Limit to 50 bytes — the
+    # cut lands mid-character (50 / 3 = 16.67). Safe truncate must drop
+    # the partial byte sequence cleanly and never raise.
+    text = "中" * 30
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="zh_tool",
+            description="Returns CJK",
+            input_schema={"type": "object", "properties": {}, "required": []},
+            handler=lambda: text,
+            timeout_s=1.0,
+            max_output_bytes=50,
+        )
+    )
+    result = asyncio.run(registry.execute("zh_tool", {}))
+    assert result.success is True
+    assert result.truncated is True
+    # Extract just the body (strip the annotation) and make sure it's
+    # valid UTF-8 with only whole '中' characters.
+    body = result.content.split("\n\n[Output truncated:")[0]
+    assert body == "中" * (50 // 3)  # exactly 16 whole characters
+    # No UnicodeDecodeError raised getting here is the real assertion.
+
+
+def test_default_max_output_bytes_applies() -> None:
+    # A ToolSpec without max_output_bytes uses DEFAULT_MAX_OUTPUT_BYTES (50_000).
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="default_tool",
+            description="Uses default cap",
+            input_schema={"type": "object", "properties": {}, "required": []},
+            handler=lambda: "x" * 100_000,
+            timeout_s=1.0,
+        )
+    )
+    result = asyncio.run(registry.execute("default_tool", {}))
+    assert result.truncated is True
+    # Body before annotation should be exactly the default cap.
+    body = result.content.split("\n\n[Output truncated:")[0]
+    assert len(body.encode("utf-8")) == 50_000
+
+
+def test_register_rejects_non_positive_max_output_bytes() -> None:
+    registry = ToolRegistry()
+    with pytest.raises(ValueError, match="max_output_bytes"):
+        registry.register(
+            ToolSpec(
+                name="busted",
+                description="bad",
+                input_schema={"type": "object"},
+                handler=lambda: "x",
+                timeout_s=1.0,
+                max_output_bytes=0,
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Call audit — ring-buffered structured log + query API.
+# ---------------------------------------------------------------------------
+
+
+def test_audit_log_records_successful_call() -> None:
+    registry = _build_registry()
+    asyncio.run(registry.execute("echo", {"text": "hi"}))
+    log = registry.get_audit_log()
+    assert len(log) == 1
+    entry = log[0]
+    assert entry["tool_name"] == "echo"
+    assert entry["success"] is True
+    assert entry["truncated"] is False
+    assert entry["elapsed_ms"] >= 0
+    assert entry["input_bytes"] > 0  # {"text": "hi"} is non-empty
+    assert entry["output_bytes"] == len("Echo: hi".encode("utf-8"))
+    assert entry["error"] is None
+    assert "T" in entry["timestamp"]  # iso8601 sanity check
+
+
+def test_audit_log_records_failure_with_error_message() -> None:
+    registry = _build_registry()
+    asyncio.run(registry.execute("echo", {"text": 123}))  # type mismatch
+    log = registry.get_audit_log()
+    assert len(log) == 1
+    assert log[0]["success"] is False
+    assert log[0]["error"] is not None
+    assert "Invalid arguments" in log[0]["error"]
+    assert log[0]["output_bytes"] == 0
+
+
+def test_audit_log_records_unknown_tool_call() -> None:
+    registry = _build_registry()
+    asyncio.run(registry.execute("no_such_tool", {}))
+    log = registry.get_audit_log()
+    assert len(log) == 1
+    assert log[0]["tool_name"] == "no_such_tool"
+    assert log[0]["success"] is False
+    assert "Unknown tool" in (log[0]["error"] or "")
+
+
+def test_audit_log_is_ring_buffered() -> None:
+    registry = ToolRegistry(audit_log_capacity=3)
+    registry.register(
+        ToolSpec(
+            name="echo",
+            description="echo",
+            input_schema={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+            handler=lambda text: f"Echo: {text}",
+            timeout_s=1.0,
+        )
+    )
+    for i in range(10):
+        asyncio.run(registry.execute("echo", {"text": f"msg{i}"}))
+
+    log = registry.get_audit_log()
+    # Capacity 3 means only the last 3 records survive.
+    assert len(log) == 3
+
+
+def test_audit_log_filters_by_tool_name() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="a",
+            description="a",
+            input_schema={"type": "object", "properties": {}, "required": []},
+            handler=lambda: "A",
+            timeout_s=1.0,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="b",
+            description="b",
+            input_schema={"type": "object", "properties": {}, "required": []},
+            handler=lambda: "B",
+            timeout_s=1.0,
+        )
+    )
+    asyncio.run(registry.execute("a", {}))
+    asyncio.run(registry.execute("b", {}))
+    asyncio.run(registry.execute("a", {}))
+
+    only_a = registry.get_audit_log(tool="a")
+    assert [entry["tool_name"] for entry in only_a] == ["a", "a"]
+
+    only_b = registry.get_audit_log(tool="b")
+    assert [entry["tool_name"] for entry in only_b] == ["b"]
+
+
+def test_audit_log_limit_returns_most_recent_n() -> None:
+    registry = _build_registry()
+    for i in range(5):
+        asyncio.run(registry.execute("echo", {"text": f"n={i}"}))
+    log = registry.get_audit_log(limit=2)
+    assert len(log) == 2
+    # Most recent last means last two calls: n=3 and n=4.
+    assert log[0]["tool_name"] == "echo"
+    assert log[-1]["output_bytes"] == len("Echo: n=4".encode("utf-8"))
 
 
 def test_malformed_schema_is_reported_cleanly() -> None:

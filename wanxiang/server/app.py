@@ -161,6 +161,27 @@ async def get_mcp_pool_status() -> dict:
     }
 
 
+@app.get("/api/tools/audit")
+async def get_tool_audit_log(
+    limit: int = Query(default=100, ge=1, le=1000),
+    tool: str | None = Query(default=None),
+) -> dict:
+    """Return the tool registry's recent call audit records.
+
+    Newest last. `limit` caps how many to return (most recent N);
+    `tool` filters by exact tool_name match before applying the limit.
+    """
+    rm = _get_run_manager()
+    registry = getattr(rm.factory, "tool_registry", None)
+    if registry is None:
+        return {"records": [], "total_returned": 0}
+    records = registry.get_audit_log(limit=limit, tool=tool)
+    return {
+        "records": records,
+        "total_returned": len(records),
+    }
+
+
 @app.websocket("/api/runs/{run_id}/events")
 async def run_events(websocket: WebSocket, run_id: str) -> None:
     await websocket.accept()
