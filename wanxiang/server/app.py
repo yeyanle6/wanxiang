@@ -101,3 +101,26 @@ async def run_events(websocket: WebSocket, run_id: str) -> None:
             await websocket.send_text(event.to_json())
     except WebSocketDisconnect:
         return
+
+
+def main() -> None:
+    import argparse
+
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description="Launch the Wanxiang web server.")
+    parser.add_argument("--host", default=os.getenv("WANXIANG_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("WANXIANG_PORT", "8000")))
+    parser.add_argument("--reload", action="store_true", help="Enable auto-reload (development only).")
+    args = parser.parse_args()
+
+    uvicorn.run(
+        "wanxiang.server.app:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+    )
+
+
+if __name__ == "__main__":
+    main()
