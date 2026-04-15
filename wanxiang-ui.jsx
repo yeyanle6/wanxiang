@@ -623,7 +623,7 @@ function DurationAnalysis({ events }) {
   return (
     <div className="rounded-xl border border-slate-200 bg-white shadow-sm">
       <div className="border-b border-slate-100 px-4 py-3 text-sm font-semibold text-slate-700">
-        区域4 · 耗时分析
+        耗时分析 · Performance
       </div>
 
       <div className="space-y-3 p-4">
@@ -759,7 +759,7 @@ function QualityInsights({ events, plan }) {
     return (
       <div className="rounded-xl border border-slate-200 bg-white shadow-sm">
         <div className="border-b border-slate-100 px-4 py-3 text-sm font-semibold text-slate-700">
-          区域5 · 质量对比
+          质量洞察 · Quality Insights
         </div>
 
         <div className="space-y-4 p-4">
@@ -875,7 +875,7 @@ function QualityInsights({ events, plan }) {
   return (
     <div className="rounded-xl border border-slate-200 bg-white shadow-sm">
       <div className="border-b border-slate-100 px-4 py-3 text-sm font-semibold text-slate-700">
-        区域5 · 质量对比
+        质量洞察 · Quality Insights
       </div>
 
       <div className="space-y-4 p-4">
@@ -1001,7 +1001,7 @@ function TaskInput({
 }) {
   return (
     <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <div className="mb-2 text-sm font-semibold text-slate-700">区域1 · 任务输入</div>
+      <div className="mb-2 text-sm font-semibold text-slate-700">任务控制台 · Control Panel</div>
       <div className="grid gap-3 md:grid-cols-[1fr_240px_auto_auto]">
         <input
           className="h-11 rounded-lg border border-slate-300 px-3 text-sm outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100 disabled:bg-slate-100"
@@ -1454,7 +1454,7 @@ function EventTimeline({ events, selectedIndex, onSelect, timelineRef }) {
   return (
     <div className="rounded-xl border border-slate-200 bg-white shadow-sm">
       <div className="border-b border-slate-100 px-4 py-3 text-sm font-semibold text-slate-700">
-        区域2 · 实时执行流
+        执行时间线 · Execution Timeline
       </div>
       <div ref={timelineRef} className="h-[520px] space-y-3 overflow-y-auto p-4">
         {events.length === 0 ? (
@@ -1483,20 +1483,20 @@ function DetailPanel({ event }) {
   const type = normalizeEventType(event?.type);
   const data = event?.data ?? {};
 
-  let title = "区域3 · 详情面板";
+  let title = "详情查看器 · Inspector";
   let body = "点击任意 agent_completed 卡片查看完整内容。";
 
   if (type === "agent_completed") {
-    title = `区域3 · ${data.agent ?? "agent"}（完整内容）`;
+    title = `详情查看器 · ${data.agent ?? "agent"}（完整内容）`;
     body = data.content ?? "";
   } else if (type === "tool_completed") {
-    title = `区域3 · 工具结果 · ${data.tool ?? "tool"}`;
+    title = `详情查看器 · 工具结果 · ${data.tool ?? "tool"}`;
     body = JSON.stringify(data, null, 2);
   } else if (type === "tool_started") {
-    title = `区域3 · 工具调用 · ${data.tool ?? "tool"}`;
+    title = `详情查看器 · 工具调用 · ${data.tool ?? "tool"}`;
     body = JSON.stringify(data, null, 2);
   } else if (type === "run_completed") {
-    title = "区域3 · Run Summary";
+    title = "详情查看器 · Run Summary";
     body = JSON.stringify(data, null, 2);
   }
 
@@ -1620,8 +1620,14 @@ function App({ defaultApiBase = inferDefaultApiBase() }) {
 
   useEffect(() => {
     if (!state.runId) return undefined;
-    if (!(state.status === "connecting" || state.status === "running")) return undefined;
 
+    // IMPORTANT: deps intentionally exclude state.status. Including status would
+    // cause React to tear down and re-open the WebSocket when run_started flips
+    // status "connecting" -> "running", dropping any event the server-side async
+    // generator had already popped from the queue but not yet flushed (the yield
+    // point is cancelled, the event is gone from the queue). Opening once per
+    // runId and letting the backend close the socket via queue.put(None) keeps
+    // the stream lossless.
     const wsUrl = toWsUrl(state.apiBase, state.runId);
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
@@ -1653,7 +1659,7 @@ function App({ defaultApiBase = inferDefaultApiBase() }) {
       ws.close();
       wsRef.current = null;
     };
-  }, [state.runId, state.status, state.apiBase]);
+  }, [state.runId, state.apiBase]);
 
   useEffect(() => {
     if (!state.replaying) return undefined;
