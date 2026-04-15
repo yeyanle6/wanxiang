@@ -4,11 +4,34 @@ import asyncio
 import json
 import os
 import shutil
+import tempfile
 from typing import Any
 
 DEFAULT_MODEL = "claude-sonnet-4-20250514"
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 VALID_LLM_MODES = {"auto", "api", "cli"}
+
+# Claude CLI auto-loads user-level MCP servers (Notion / Gmail / etc.).
+# When Wanxiang uses `claude -p` as a text-generation backend we don't
+# want that — our own tools/loops are separately orchestrated and having
+# Claude CLI drive its own MCP round-trips produces unpredictable hangs.
+# The workaround is --strict-mcp-config + an empty config file so
+# Claude CLI starts with zero MCP servers.
+_WANXIANG_EMPTY_MCP_CONFIG_PATH: str | None = None
+
+
+def _ensure_empty_mcp_config() -> str:
+    global _WANXIANG_EMPTY_MCP_CONFIG_PATH
+    path = _WANXIANG_EMPTY_MCP_CONFIG_PATH
+    if path and os.path.exists(path):
+        return path
+    fd, new_path = tempfile.mkstemp(
+        prefix="wanxiang-empty-mcp-", suffix=".json"
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump({"mcpServers": {}}, handle)
+    _WANXIANG_EMPTY_MCP_CONFIG_PATH = new_path
+    return new_path
 
 
 class LLMClient:
@@ -175,6 +198,7 @@ class LLMClient:
         prompt = self._render_cli_prompt(messages)
         if system:
             prompt = f"SYSTEM:\n{system.strip()}\n\n{prompt}"
+        empty_mcp_config = _ensure_empty_mcp_config()
         command = [
             claude_bin,
             "-p",
@@ -182,6 +206,9 @@ class LLMClient:
             self.model,
             "--permission-mode",
             "dontAsk",
+            "--strict-mcp-config",
+            "--mcp-config",
+            empty_mcp_config,
         ]
 
         env = os.environ.copy()
@@ -227,6 +254,9 @@ class LLMClient:
             self.model,
             "--permission-mode",
             "dontAsk",
+            "--strict-mcp-config",
+            "--mcp-config",
+            _ensure_empty_mcp_config(),
             "--output-format",
             "json",
         ]
