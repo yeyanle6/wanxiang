@@ -155,8 +155,8 @@ Coverage spans Message protocol, three workflow engines, AgentFactory policies, 
 - [x] Phase 1–3: engine, UI, event stream, MCP status probe, 53 tests
 - [ ] Phase 3C: external MCP server integration (filesystem → web_search via MCP → Notion)
 - [x] Packaging: `pyproject.toml` with `pip install -e ".[dev]"`
-- [ ] UI polish: Draft Versions counter fix, region naming, dark mode
-- [ ] `ProjectGuide.md` — architecture evolution log
+- [x] UI polish: WebSocket event loss fix, bilingual region naming (dark mode pending)
+- [x] `ProjectGuide.md` — architecture evolution log
 
 ---
 
@@ -258,8 +258,8 @@ pytest -q
 - [x] Phase 1–3：引擎、UI、事件流、MCP 状态探测，53 个测试
 - [ ] Phase 3C：接入真实外部 MCP server（filesystem → MCP web_search → Notion）
 - [x] 打包：`pyproject.toml` + `pip install -e ".[dev]"`
-- [ ] UI 润色：Draft Versions 计数修复、区域命名正式化、深色模式
-- [ ] `ProjectGuide.md` —— 架构演进记录
+- [x] UI 润色：WebSocket 事件丢失修复、区域命名中英化（深色模式待做）
+- [x] `ProjectGuide.md` —— 架构演进记录
 
 ---
 
