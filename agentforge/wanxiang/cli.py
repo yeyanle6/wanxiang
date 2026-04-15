@@ -44,12 +44,12 @@ def _confirm_or_exit(auto_confirm: bool) -> bool:
 
 
 async def _run_task(task: str, *, auto_confirm: bool = False, llm_mode: str | None = None) -> int:
-    _separator("AgentForge")
+    _separator("Wanxiang")
     print(f"Task: {task}")
 
     factory = AgentFactory(
         tool_registry=create_default_registry(),
-        llm_mode=llm_mode or os.getenv("AGENTFORGE_LLM_MODE"),
+        llm_mode=llm_mode or os.getenv("WANXIANG_LLM_MODE"),
     )
 
     _separator("Stage 1/3 - Plan Team")
@@ -117,7 +117,7 @@ async def _run_task(task: str, *, auto_confirm: bool = False, llm_mode: str | No
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run AgentForge workflow from the command line.")
+    parser = argparse.ArgumentParser(description="Run Wanxiang workflow from the command line.")
     parser.add_argument("task", nargs="*", help="Task description for the multi-agent run.")
     parser.add_argument(
         "-y",
@@ -129,7 +129,7 @@ def main() -> None:
         "--llm-mode",
         choices=["auto", "api", "cli"],
         default=None,
-        help="LLM backend mode. Default uses AGENTFORGE_LLM_MODE or auto detection.",
+        help="LLM backend mode. Default uses WANXIANG_LLM_MODE or auto detection.",
     )
     args = parser.parse_args()
 

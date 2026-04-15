@@ -24,7 +24,7 @@ class WorkflowEngine:
         self.agents = agents
         self.plan = plan
         self.on_event = on_event
-        self.logger = logging.getLogger("agentforge.workflow")
+        self.logger = logging.getLogger("wanxiang.workflow")
         self._validate_plan()
 
     async def run(self, task: Message, on_step: StepCallback | None = None) -> list[Message]:

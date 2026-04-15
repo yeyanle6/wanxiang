@@ -1,6 +1,6 @@
 import asyncio
 
-from agentforge.core.tools import ToolRegistry, ToolSpec
+from wanxiang.core.tools import ToolRegistry, ToolSpec
 
 
 def _build_registry() -> ToolRegistry:

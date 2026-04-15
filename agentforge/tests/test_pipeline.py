@@ -1,8 +1,8 @@
 import asyncio
 
-from agentforge.core.factory import TeamPlan
-from agentforge.core.message import Message, MessageStatus
-from agentforge.core.pipeline import WorkflowEngine
+from wanxiang.core.factory import TeamPlan
+from wanxiang.core.message import Message, MessageStatus
+from wanxiang.core.pipeline import WorkflowEngine
 
 
 class MockAgent:

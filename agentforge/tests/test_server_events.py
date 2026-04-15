@@ -1,4 +1,4 @@
-from agentforge.server.events import RunEvent
+from wanxiang.server.events import RunEvent
 
 
 def test_run_started_includes_llm_mode_fields_when_provided() -> None:

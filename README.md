@@ -92,18 +92,18 @@ export ANTHROPIC_API_KEY=sk-ant-...          # API mode (full feature set)
 claude auth login                              # CLI mode (no native tools)
 
 # 4a. Run a one-shot task from the CLI
-PYTHONPATH=. python -m agentforge.cli -y "Write a 500-word blog post on multi-agent systems"
+PYTHONPATH=. python -m wanxiang.cli -y "Write a 500-word blog post on multi-agent systems"
 
 # 4b. Or launch the web UI
-PYTHONPATH=. uvicorn agentforge.server.app:app --port 8000
+PYTHONPATH=. uvicorn wanxiang.server.app:app --port 8000
 # Open http://127.0.0.1:8000
 ```
 
 Optional mode overrides:
 
 ```bash
-PYTHONPATH=. python -m agentforge.cli --llm-mode cli "your task"
-AGENTFORGE_LLM_MODE=api uvicorn agentforge.server.app:app --port 8000
+PYTHONPATH=. python -m wanxiang.cli --llm-mode cli "your task"
+WANXIANG_LLM_MODE=api uvicorn wanxiang.server.app:app --port 8000
 ```
 
 ### Workflows
@@ -140,7 +140,7 @@ Coverage spans Message protocol, three workflow engines, AgentFactory policies, 
 ```
 .
 ├── agentforge/
-│   ├── agentforge/
+│   ├── wanxiang/
 │   │   ├── core/          # Message, BaseAgent, Factory, WorkflowEngine, Tools, LLMClient
 │   │   ├── server/        # FastAPI app, RunManager, events, MCP probe
 │   │   ├── cli.py         # One-shot CLI entry point
@@ -148,7 +148,7 @@ Coverage spans Message protocol, three workflow engines, AgentFactory policies, 
 │   ├── configs/agents/    # Example agent YAML configs
 │   ├── data/              # Runtime JSONL history (gitignored)
 │   └── tests/             # 53 pytest tests
-├── agentforge-ui.jsx      # Single-file React UI served by the FastAPI app
+├── wanxiang-ui.jsx      # Single-file React UI served by the FastAPI app
 └── README.md
 ```
 
@@ -197,18 +197,18 @@ export ANTHROPIC_API_KEY=sk-ant-...          # API 模式（完整能力）
 claude auth login                              # CLI 模式（无 native tools）
 
 # 4a. 从 CLI 一次性跑一个任务
-PYTHONPATH=. python -m agentforge.cli -y "写一篇关于多 Agent 系统的 500 字博客"
+PYTHONPATH=. python -m wanxiang.cli -y "写一篇关于多 Agent 系统的 500 字博客"
 
 # 4b. 或启动 Web UI
-PYTHONPATH=. uvicorn agentforge.server.app:app --port 8000
+PYTHONPATH=. uvicorn wanxiang.server.app:app --port 8000
 # 浏览器打开 http://127.0.0.1:8000
 ```
 
 可选的模式覆盖：
 
 ```bash
-PYTHONPATH=. python -m agentforge.cli --llm-mode cli "你的任务"
-AGENTFORGE_LLM_MODE=api uvicorn agentforge.server.app:app --port 8000
+PYTHONPATH=. python -m wanxiang.cli --llm-mode cli "你的任务"
+WANXIANG_LLM_MODE=api uvicorn wanxiang.server.app:app --port 8000
 ```
 
 ### 工作流模式
@@ -245,7 +245,7 @@ PYTHONPATH=. pytest -q
 ```
 .
 ├── agentforge/
-│   ├── agentforge/
+│   ├── wanxiang/
 │   │   ├── core/          # Message、BaseAgent、Factory、WorkflowEngine、Tools、LLMClient
 │   │   ├── server/        # FastAPI app、RunManager、事件、MCP 探测
 │   │   ├── cli.py         # 一次性 CLI 入口
@@ -253,7 +253,7 @@ PYTHONPATH=. pytest -q
 │   ├── configs/agents/    # 示例 agent YAML 配置
 │   ├── data/              # 运行时 JSONL 历史（已 gitignore）
 │   └── tests/             # 53 个 pytest 测试
-├── agentforge-ui.jsx      # FastAPI 提供的单文件 React UI
+├── wanxiang-ui.jsx      # FastAPI 提供的单文件 React UI
 └── README.md
 ```
 

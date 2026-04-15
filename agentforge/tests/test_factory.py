@@ -1,4 +1,4 @@
-from agentforge.core.factory import AgentFactory, TeamPlan
+from wanxiang.core.factory import AgentFactory, TeamPlan
 
 
 def _make_factory() -> AgentFactory:

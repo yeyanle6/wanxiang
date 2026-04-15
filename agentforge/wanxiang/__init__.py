@@ -1,0 +1,2 @@
+"""Wanxiang package."""
+

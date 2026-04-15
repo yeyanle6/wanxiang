@@ -9,10 +9,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from agentforge.core.builtin_tools import create_default_registry
-from agentforge.core.factory import AgentFactory
-from agentforge.core.message import Message, MessageStatus
-from agentforge.core.pipeline import WorkflowEngine
+from wanxiang.core.builtin_tools import create_default_registry
+from wanxiang.core.factory import AgentFactory
+from wanxiang.core.message import Message, MessageStatus
+from wanxiang.core.pipeline import WorkflowEngine
 
 from .events import RunEvent
 

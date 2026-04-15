@@ -50,7 +50,7 @@ class ToolResult:
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolSpec] = {}
-        self.logger = logging.getLogger("agentforge.tools")
+        self.logger = logging.getLogger("wanxiang.tools")
 
     def register(self, spec: ToolSpec) -> None:
         name = spec.name.strip()

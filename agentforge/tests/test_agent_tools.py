@@ -1,9 +1,9 @@
 import asyncio
 from typing import Any
 
-from agentforge.core.agent import AgentConfig, BaseAgent
-from agentforge.core.message import Message, MessageStatus
-from agentforge.core.tools import ToolRegistry, ToolSpec
+from wanxiang.core.agent import AgentConfig, BaseAgent
+from wanxiang.core.message import Message, MessageStatus
+from wanxiang.core.tools import ToolRegistry, ToolSpec
 
 
 class _ScriptedClient:

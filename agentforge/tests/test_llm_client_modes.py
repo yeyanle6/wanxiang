@@ -1,6 +1,6 @@
 import asyncio
 
-from agentforge.core.llm_client import LLMClient
+from wanxiang.core.llm_client import LLMClient
 
 
 def test_resolve_mode_api_when_explicit_and_key_present() -> None:

@@ -17,9 +17,9 @@ from .models import (
 )
 from .runner import RunManager
 
-app = FastAPI(title="AgentForge Server", version="0.1.0")
-run_manager = RunManager(llm_mode=os.getenv("AGENTFORGE_LLM_MODE"))
-UI_FILE = Path(__file__).resolve().parents[3] / "agentforge-ui.jsx"
+app = FastAPI(title="Wanxiang Server", version="0.1.0")
+run_manager = RunManager(llm_mode=os.getenv("WANXIANG_LLM_MODE"))
+UI_FILE = Path(__file__).resolve().parents[3] / "wanxiang-ui.jsx"
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,7 +40,7 @@ async def index() -> str:
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AgentForge UI</title>
+    <title>Wanxiang UI</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
@@ -48,12 +48,12 @@ async def index() -> str:
   </head>
   <body class="bg-slate-100">
     <div id="app"></div>
-    <script type="text/babel" data-presets="react" src="/ui/agentforge-ui.jsx"></script>
+    <script type="text/babel" data-presets="react" src="/ui/wanxiang-ui.jsx"></script>
   </body>
 </html>"""
 
 
-@app.get("/ui/agentforge-ui.jsx")
+@app.get("/ui/wanxiang-ui.jsx")
 async def ui_script() -> FileResponse:
     if not UI_FILE.exists():
         raise HTTPException(status_code=404, detail=f"UI file not found: {UI_FILE}")

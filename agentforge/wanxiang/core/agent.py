@@ -126,7 +126,7 @@ class BaseAgent:
             api_key=self.api_key,
             mode=llm_mode,
         )
-        self.logger = logging.getLogger(f"agentforge.agent.{config.name}")
+        self.logger = logging.getLogger(f"wanxiang.agent.{config.name}")
 
     async def refine_persona(self, message: Message) -> str:
         persona_request = self.config.render_persona_prompt(message)

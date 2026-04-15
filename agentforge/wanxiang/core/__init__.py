@@ -1,4 +1,4 @@
-"""Core primitives for AgentForge."""
+"""Core primitives for Wanxiang."""
 
 from .agent import AgentConfig, BaseAgent
 from .builtin_tools import create_default_registry

@@ -1,4 +1,4 @@
-from agentforge.server.mcp_status import parse_mcp_list_output
+from wanxiang.server.mcp_status import parse_mcp_list_output
 
 
 def test_parse_mcp_list_output_extracts_connected_and_disconnected_servers() -> None:

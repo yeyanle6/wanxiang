@@ -174,7 +174,7 @@ class AgentFactory:
             api_key=self.api_key,
             mode=self.llm_mode,
         )
-        self.logger = logging.getLogger("agentforge.factory")
+        self.logger = logging.getLogger("wanxiang.factory")
 
     async def create_team(self, task: str) -> TeamPlan:
         cleaned_task = task.strip()

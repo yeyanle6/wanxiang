@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime
 
-from agentforge.core.builtin_tools import create_default_registry
+from wanxiang.core.builtin_tools import create_default_registry
 
 
 def test_default_registry_contains_echo_and_current_time() -> None:

@@ -27,7 +27,7 @@ class LLMClient:
         self.temperature = temperature
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         self.oauth_token = oauth_token or os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
-        resolved_mode = (mode or os.getenv("AGENTFORGE_LLM_MODE") or "auto").strip().lower()
+        resolved_mode = (mode or os.getenv("WANXIANG_LLM_MODE") or "auto").strip().lower()
         if resolved_mode not in VALID_LLM_MODES:
             raise ValueError(
                 f"Invalid LLM mode '{resolved_mode}'. Expected one of: {', '.join(sorted(VALID_LLM_MODES))}."

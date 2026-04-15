@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from agentforge.core.message import Message, MessageStatus
+from wanxiang.core.message import Message, MessageStatus
 
 
 def test_message_defaults_and_auto_fields() -> None:
