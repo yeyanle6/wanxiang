@@ -172,50 +172,30 @@ class ToolRegistry:
         return await asyncio.to_thread(spec.handler, **arguments)
 
     def _validate_arguments(self, schema: dict[str, Any], arguments: dict[str, Any]) -> str | None:
+        """Validate `arguments` against JSON Schema using jsonschema library.
+
+        Delegates to the reference JSON Schema validator so we get full
+        Draft 7+ coverage for free: nested objects, enum, minimum/maximum,
+        pattern, array items, anyOf/oneOf, additionalProperties, etc.
+        """
         if not isinstance(arguments, dict):
             return "arguments must be an object"
-        if not isinstance(schema, dict):
+        if not isinstance(schema, dict) or not schema:
             return None
-
-        expected_type = schema.get("type")
-        if expected_type and expected_type != "object":
-            return "input_schema.type must be 'object'"
-
-        required = schema.get("required", [])
-        if isinstance(required, list):
-            for key in required:
-                if key not in arguments:
-                    return f"missing required field '{key}'"
-
-        properties = schema.get("properties", {})
-        if isinstance(properties, dict):
-            for key, value in arguments.items():
-                prop_schema = properties.get(key)
-                if not isinstance(prop_schema, dict):
-                    if schema.get("additionalProperties", True):
-                        continue
-                    return f"unexpected field '{key}'"
-                expected = prop_schema.get("type")
-                if expected and not self._matches_type(value, str(expected)):
-                    return f"field '{key}' expected type '{expected}'"
+        try:
+            import jsonschema
+        except ImportError:  # pragma: no cover - dependency should always be installed
+            return "jsonschema library is not installed"
+        try:
+            jsonschema.validate(instance=arguments, schema=schema)
+        except jsonschema.ValidationError as exc:
+            location = ".".join(str(part) for part in exc.absolute_path)
+            if location:
+                return f"{exc.message} (at '{location}')"
+            return exc.message
+        except jsonschema.SchemaError as exc:
+            return f"invalid input_schema: {exc.message}"
         return None
-
-    def _matches_type(self, value: Any, expected: str) -> bool:
-        if expected == "string":
-            return isinstance(value, str)
-        if expected == "boolean":
-            return isinstance(value, bool)
-        if expected == "integer":
-            return isinstance(value, int) and not isinstance(value, bool)
-        if expected == "number":
-            return (isinstance(value, int) and not isinstance(value, bool)) or isinstance(value, float)
-        if expected == "object":
-            return isinstance(value, dict)
-        if expected == "array":
-            return isinstance(value, list)
-        if expected == "null":
-            return value is None
-        return True
 
     def _stringify_result(self, raw_result: Any) -> str:
         if isinstance(raw_result, str):
