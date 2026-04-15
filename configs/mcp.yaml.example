@@ -9,6 +9,11 @@
 #   mkdir -p /tmp/wanxiang-test
 #   echo "Hello Wanxiang" > /tmp/wanxiang-test/demo.txt
 #   # npx fetches the server package on first run.
+#
+# macOS note: /tmp is a symlink to /private/tmp, and the filesystem
+# server canonicalizes its root before enforcing the sandbox. Pass the
+# canonical path (/private/tmp/wanxiang-test) or tool calls with
+# /tmp/... paths will fail with "path outside allowed directories".
 
 servers:
   # Filesystem — reads/writes under a sandboxed root directory.
