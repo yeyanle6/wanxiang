@@ -1,9 +1,27 @@
 from wanxiang.core.factory import AgentFactory, TeamPlan
+from wanxiang.core.tools import ToolRegistry, ToolSpec
 
 
-def _make_factory() -> AgentFactory:
+def _make_factory(tool_registry: ToolRegistry | None = None) -> AgentFactory:
     # No network calls in these tests; we only exercise policy logic.
-    return AgentFactory(api_key="test-key")
+    return AgentFactory(api_key="test-key", tool_registry=tool_registry)
+
+
+def _spec(
+    name: str,
+    *,
+    description: str = "",
+    group: str = "",
+    allowed_agents: list[str] | None = None,
+) -> ToolSpec:
+    return ToolSpec(
+        name=name,
+        description=description,
+        input_schema={"type": "object", "properties": {}},
+        handler=lambda **_: None,
+        group=group,
+        allowed_agents=list(allowed_agents or []),
+    )
 
 
 def test_parallel_policy_adds_synthesizer_and_keeps_it_last() -> None:
@@ -293,3 +311,162 @@ def test_research_content_policy_assigns_web_search_and_raises_iterations() -> N
     assert updated.max_iterations >= 3
     assert writer.native_tools and writer.native_tools[0]["name"] == "web_search"
     assert reviewer.native_tools == []
+
+
+def test_format_tools_for_planner_groups_by_source_with_descriptions() -> None:
+    registry = ToolRegistry()
+    registry.register(_spec("echo", description="Echo text back"))
+    registry.register(_spec("current_time", description="Return UTC time"))
+    registry.register(
+        _spec(
+            "read_text_file",
+            description="Read contents of a text file",
+            group="filesystem",
+            allowed_agents=["researcher"],
+        )
+    )
+    registry.register(
+        _spec(
+            "write_file",
+            description="Write to a file",
+            group="filesystem",
+            allowed_agents=["researcher"],
+        )
+    )
+
+    factory = _make_factory(tool_registry=registry)
+    rendered = factory._format_tools_for_planner()
+
+    # Builtin tools come first and carry no restriction marker.
+    builtin_idx = rendered.index("builtin:")
+    fs_idx = rendered.index("filesystem (MCP server):")
+    assert builtin_idx < fs_idx
+
+    assert "- echo: Echo text back" in rendered
+    assert "- current_time: Return UTC time" in rendered
+    assert "- read_text_file: Read contents of a text file (restricted to ['researcher'])" in rendered
+    assert "- write_file: Write to a file (restricted to ['researcher'])" in rendered
+
+
+def test_format_tools_for_planner_returns_none_marker_when_empty() -> None:
+    registry = ToolRegistry()
+    factory = _make_factory(tool_registry=registry)
+    assert factory._format_tools_for_planner() == "(none)"
+
+
+def test_apply_tool_restrictions_strips_disallowed_tool_from_agent() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        _spec(
+            "read_text_file",
+            description="Read a file",
+            group="filesystem",
+            allowed_agents=["researcher"],
+        )
+    )
+    registry.register(_spec("echo", description="Echo"))  # open to all
+
+    factory = _make_factory(tool_registry=registry)
+    plan = TeamPlan.from_dict(
+        {
+            "workflow": "pipeline",
+            "execution_order": ["writer", "reviewer"],
+            "agents": [
+                {
+                    "name": "writer",
+                    "duty": "draft",
+                    "base_identity": "You are a writer.",
+                    "allowed_tools": ["read_text_file", "echo"],
+                },
+                {
+                    "name": "reviewer",
+                    "duty": "review",
+                    "base_identity": "You are a reviewer.",
+                },
+            ],
+        }
+    )
+
+    updated = factory._apply_tool_restrictions(plan)
+    writer = next(spec for spec in updated.agents if spec.name == "writer")
+
+    # read_text_file is stripped (writer not in allowed_agents).
+    # echo stays (no restriction).
+    assert writer.allowed_tools == ["echo"]
+
+
+def test_apply_tool_restrictions_keeps_tool_when_agent_is_authorized() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        _spec(
+            "read_text_file",
+            description="Read a file",
+            group="filesystem",
+            allowed_agents=["researcher", "reader"],
+        )
+    )
+
+    factory = _make_factory(tool_registry=registry)
+    plan = TeamPlan.from_dict(
+        {
+            "workflow": "pipeline",
+            "execution_order": ["researcher", "reviewer"],
+            "agents": [
+                {
+                    "name": "researcher",
+                    "duty": "research",
+                    "base_identity": "You are a researcher.",
+                    "allowed_tools": ["read_text_file"],
+                },
+                {
+                    "name": "reviewer",
+                    "duty": "review",
+                    "base_identity": "You are a reviewer.",
+                },
+            ],
+        }
+    )
+
+    updated = factory._apply_tool_restrictions(plan)
+    researcher = next(spec for spec in updated.agents if spec.name == "researcher")
+    assert researcher.allowed_tools == ["read_text_file"]
+
+
+def test_apply_tool_restrictions_runs_inside_policy_pipeline() -> None:
+    """End-to-end: full _apply_planning_policies must also strip disallowed tools."""
+    registry = ToolRegistry()
+    registry.register(
+        _spec(
+            "read_text_file",
+            description="Read a file",
+            group="filesystem",
+            allowed_agents=["researcher"],
+        )
+    )
+
+    factory = _make_factory(tool_registry=registry)
+    plan = TeamPlan.from_dict(
+        {
+            "workflow": "pipeline",
+            "execution_order": ["analyst", "reviewer"],
+            "agents": [
+                {
+                    "name": "analyst",
+                    "duty": "analyze",
+                    "base_identity": "You are an analyst.",
+                    "allowed_tools": ["read_text_file"],
+                },
+                {
+                    "name": "reviewer",
+                    "duty": "review",
+                    "base_identity": "You are a reviewer.",
+                },
+            ],
+        }
+    )
+
+    updated = factory._apply_planning_policies("analyze something", plan)
+    analyst = next(spec for spec in updated.agents if spec.name == "analyst")
+    # Director named the agent 'analyst', but the tool is restricted to 'researcher'.
+    # Policy should have stripped it.
+    assert analyst.allowed_tools == []

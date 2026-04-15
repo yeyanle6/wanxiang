@@ -5,7 +5,7 @@ import inspect
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
@@ -20,6 +20,12 @@ class ToolSpec:
     handler: ToolHandler
     timeout_s: float = 30.0
     requires_confirmation: bool = False
+    # Source group: empty string = builtin. MCP bridge sets this to the
+    # server name so the planner prompt can group related tools together.
+    group: str = ""
+    # Exact agent names allowed to use this tool. Empty list = any agent.
+    # Enforced by AgentFactory policy layer when applying team plans.
+    allowed_agents: list[str] = field(default_factory=list)
 
     def to_claude_tool(self) -> dict[str, Any]:
         return {
@@ -27,6 +33,11 @@ class ToolSpec:
             "description": self.description,
             "input_schema": self.input_schema,
         }
+
+    def is_agent_allowed(self, agent_name: str) -> bool:
+        if not self.allowed_agents:
+            return True
+        return agent_name in self.allowed_agents
 
 
 @dataclass(slots=True)

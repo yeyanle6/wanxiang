@@ -158,6 +158,7 @@ class MCPPool:
                     client,
                     prefix=decl.prefix,
                     timeout_s=decl.config.timeout_s,
+                    allowed_agents=decl.allowed_agents,
                 )
             except Exception:
                 logger.exception(

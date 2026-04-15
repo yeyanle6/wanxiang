@@ -72,6 +72,7 @@ async def register_mcp_tools(
     *,
     prefix: str = "",
     timeout_s: float = 30.0,
+    allowed_agents: list[str] | None = None,
 ) -> list[str]:
     """Fetch the MCP server's tools and register them into the registry.
 
@@ -83,12 +84,15 @@ async def register_mcp_tools(
             prefer the raw name when possible so Claude's tool_use blocks
             (which reference names as declared to the API) match directly.
         timeout_s: Per-call timeout attached to the resulting ToolSpec.
+        allowed_agents: If non-empty, only agents with names in this list
+            can use the registered tools. Empty/None = any agent.
 
     Returns the list of names that were actually registered (skipping
     empty-name or duplicate entries).
     """
     tools = await client.list_tools()
     registered: list[str] = []
+    allowed = list(allowed_agents or [])
     for tool in tools:
         raw_name = str(tool.get("name", "")).strip()
         if not raw_name:
@@ -105,6 +109,8 @@ async def register_mcp_tools(
             input_schema=input_schema,
             handler=_make_mcp_handler(client, raw_name),
             timeout_s=timeout_s,
+            group=client.server_name,
+            allowed_agents=list(allowed),
         )
         try:
             registry.register(spec)
@@ -119,9 +125,10 @@ async def register_mcp_tools(
         registered.append(registered_name)
 
     logger.info(
-        "Registered %d MCP tools from server=%s: %s",
+        "Registered %d MCP tools from server=%s (allowed_agents=%s): %s",
         len(registered),
         client.server_name,
+        allowed or "any",
         registered,
     )
     return registered

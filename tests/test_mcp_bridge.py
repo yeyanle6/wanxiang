@@ -203,6 +203,52 @@ def test_duplicate_registration_is_skipped_not_fatal() -> None:
     asyncio.run(scenario())
 
 
+def test_register_mcp_tools_attaches_group_and_allowed_agents() -> None:
+    async def scenario() -> None:
+        client = _FakeMCPClient(
+            tools=[
+                {"name": "read_file", "description": "Read a file", "inputSchema": {"type": "object"}},
+                {"name": "write_file", "description": "Write a file", "inputSchema": {"type": "object"}},
+            ]
+        )
+        client.server_name = "filesystem"
+        registry = ToolRegistry()
+        await register_mcp_tools(  # type: ignore[arg-type]
+            registry, client, allowed_agents=["researcher", "reader"]
+        )
+
+        spec_read = registry.get("read_file")
+        spec_write = registry.get("write_file")
+        assert spec_read is not None and spec_write is not None
+        # group carries the server name; allowed_agents is attached verbatim.
+        assert spec_read.group == "filesystem"
+        assert spec_read.allowed_agents == ["researcher", "reader"]
+        assert spec_write.group == "filesystem"
+        assert spec_write.allowed_agents == ["researcher", "reader"]
+        # is_agent_allowed enforces the list.
+        assert spec_read.is_agent_allowed("researcher") is True
+        assert spec_read.is_agent_allowed("writer") is False
+
+
+    asyncio.run(scenario())
+
+
+def test_register_mcp_tools_with_empty_allowed_agents_means_any() -> None:
+    async def scenario() -> None:
+        client = _FakeMCPClient(
+            tools=[{"name": "echo_mcp", "description": "", "inputSchema": {"type": "object"}}]
+        )
+        registry = ToolRegistry()
+        await register_mcp_tools(registry, client)  # type: ignore[arg-type]
+
+        spec = registry.get("echo_mcp")
+        assert spec is not None
+        assert spec.allowed_agents == []
+        assert spec.is_agent_allowed("anyone") is True
+
+    asyncio.run(scenario())
+
+
 def test_empty_name_tools_are_ignored() -> None:
     async def scenario() -> None:
         client = _FakeMCPClient(

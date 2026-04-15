@@ -261,9 +261,7 @@ class AgentFactory:
         return snapshot
 
     async def _call_planner(self, messages: list[dict[str, Any]]) -> str:
-        available_tools = (
-            ", ".join(self.tool_registry.list_tools()) if self.tool_registry else "(none)"
-        )
+        available_tools = self._format_tools_for_planner()
         available_native_tools = (
             '- web_search: {"type":"web_search_20250305","name":"web_search","max_uses":5}'
         )
@@ -301,19 +299,100 @@ class AgentFactory:
             '- Example: ["researcher_a", "researcher_b", "synthesizer"]\n'
             "- Parallel branches all receive the same input and run concurrently.\n"
             "- Ensure execution_order references existing agent names.\n"
-            f"- Available tools: {available_tools}\n"
-            "Available native tools:\n"
-            f"{available_native_tools}\n"
+            "\nAvailable registry tools (local + MCP):\n"
+            f"{available_tools}\n"
+            "\nAvailable native tools (Claude API, server-side):\n"
+            f"{available_native_tools}\n\n"
+            "Tool assignment rules:\n"
             "- Assign allowed_tools only when needed, and only from available tools.\n"
             "- Keep allowed_tools empty for agents that do not need tools.\n"
             "- For research/parallel tasks, assign web_search native tool to researcher branches.\n"
             "- For content tasks requiring current facts, writer may use web_search native tool.\n"
-            "- Reviewer should not receive web_search native tool."
+            "- Reviewer should not receive web_search native tool.\n"
+            "- When a tool has an access restriction (shown as `restricted to [...]`), "
+            "assign it only to agents whose name matches one of the listed names. "
+            "If the task needs such a tool, name the agent accordingly (e.g., name the "
+            "researcher 'researcher' instead of 'analyst')."
         )
         raw = await self.client.generate(messages=messages, system=system_prompt)
         if not raw:
             raise RuntimeError("Factory planner returned no text content.")
         return raw
+
+    def _format_tools_for_planner(self) -> str:
+        """Group registry tools by source and render with descriptions.
+
+        Builtin tools (no `group` attribute) land under "builtin"; MCP
+        tools group by server name. Each tool line includes description
+        and, if applicable, `(restricted to [...])` so the Director can
+        assign tools to matching agent names.
+        """
+        if self.tool_registry is None:
+            return "(none)"
+        groups: dict[str, list[Any]] = {}
+        for name in self.tool_registry.list_tools():
+            spec = self.tool_registry.get(name)
+            if spec is None:
+                continue
+            group_key = spec.group or "builtin"
+            groups.setdefault(group_key, []).append(spec)
+        if not groups:
+            return "(none)"
+
+        # Stable ordering: builtin first, then MCP servers alphabetically.
+        ordered_keys = sorted(
+            groups.keys(),
+            key=lambda k: (0 if k == "builtin" else 1, k),
+        )
+        lines: list[str] = []
+        for key in ordered_keys:
+            header = (
+                "builtin:"
+                if key == "builtin"
+                else f"{key} (MCP server):"
+            )
+            lines.append(header)
+            for spec in groups[key]:
+                restriction = ""
+                if spec.allowed_agents:
+                    restriction = (
+                        f" (restricted to {spec.allowed_agents})"
+                    )
+                desc = (spec.description or "").strip().replace("\n", " ")
+                if len(desc) > 140:
+                    desc = desc[:137] + "..."
+                lines.append(f"  - {spec.name}: {desc}{restriction}")
+        return "\n".join(lines)
+
+    def _apply_tool_restrictions(self, plan: TeamPlan) -> TeamPlan:
+        """Strip disallowed tools from each agent's allowed_tools.
+
+        If a tool's allowed_agents list is non-empty and the agent's
+        name is not in it, remove that tool from the agent's allowlist.
+        Logs every strip so ops can debug why a tool was omitted.
+        """
+        if self.tool_registry is None:
+            return plan
+        for spec in plan.agents:
+            if not spec.allowed_tools:
+                continue
+            kept: list[str] = []
+            for tool_name in spec.allowed_tools:
+                tool_spec = self.tool_registry.get(tool_name)
+                if tool_spec is None:
+                    kept.append(tool_name)
+                    continue
+                if tool_spec.is_agent_allowed(spec.name):
+                    kept.append(tool_name)
+                else:
+                    self.logger.warning(
+                        "Stripped tool '%s' from agent '%s' (allowed_agents=%s)",
+                        tool_name,
+                        spec.name,
+                        tool_spec.allowed_agents,
+                    )
+            spec.allowed_tools = kept
+        return plan
 
     def _parse_json_response(self, raw_text: str) -> dict[str, Any]:
         text = raw_text.strip()
@@ -355,13 +434,13 @@ class AgentFactory:
             if not native_tools_supported:
                 self._strip_all_native_tools(plan)
             self._strip_web_search_from_agent(plan, reviewer_name)
-            return plan
+            return self._apply_tool_restrictions(plan)
 
         if plan.workflow == "parallel":
             self._ensure_parallel_structure(plan)
             if not native_tools_supported:
                 self._strip_all_native_tools(plan)
-            return plan
+            return self._apply_tool_restrictions(plan)
 
         # Enforce minimum collaboration size.
         if len(plan.agents) < 2:
@@ -377,7 +456,7 @@ class AgentFactory:
         if not native_tools_supported:
             self._strip_all_native_tools(plan)
 
-        return plan
+        return self._apply_tool_restrictions(plan)
 
     def _strip_all_native_tools(self, plan: TeamPlan) -> None:
         for spec in plan.agents:
