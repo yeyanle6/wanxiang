@@ -127,6 +127,27 @@ Evaluation rules for THIS run (tool-aware):
 
 复测结果：同一任务，2 轮迭代直接 SUCCESS，总耗时 194 秒。
 
+### Phase 3C：接入真实外部 MCP server
+**目标**：让 Agent 能调用**本地子进程 MCP server 提供的工具**（不止 Claude API 的 server-side tools）。
+
+关键文件：
+- `core/mcp_client.py` —— JSON-RPC 2.0 协议层 + stdio transport（reader-task pattern，按 id 路由响应）
+- `core/mcp_bridge.py` —— MCP tools → ToolSpec（schema 透传），handler 包装 call_tool + text extraction
+- `core/mcp_loader.py` —— YAML 配置解析 + `MCPPool` 管理多 server 生命周期
+- `server/app.py` —— FastAPI `lifespan` 绑定 pool 启停
+
+分三步递进：
+
+- **3C.1 协议层**：stdio JSON-RPC 客户端。关键是 reader-task pattern——一个后台 task 消费所有出站字节，按 id 把响应路由到对应的 Future（见 D9）。8 个单测用内存 transport 覆盖握手、tools/list、tools/call、error、timeout、close 等边界
+- **3C.2 桥接 + 生命周期**：`register_mcp_tools` 把 `tools/list` 结果转成 ToolSpec，**inputSchema 原样透传**（MCP 的 JSON Schema 格式和 Claude API 的 input_schema 一致，无需转换）；`MCPPool` 绑定 FastAPI lifespan，shutdown 时优雅关闭子进程。配置走 `configs/mcp.yaml`（gitignored），模板在 `mcp.yaml.example`
+- **3C.3 Director 感知 + allowed_agents ACL**：ToolSpec 加 `group` 字段（builtin/server 分组），planner prompt 按源分组展示工具**带描述**——Director 现在能看到 "filesystem (MCP server):\n  - read_text_file: Read text file..." 这样的块，自主决定给哪个 agent 分配。新增 `allowed_agents` 字段（名字级 ACL），`_apply_tool_restrictions` policy 在每个规划出口强制裁剪
+
+**收尾两个关键修复**：
+- **CLI MCP 隔离**（D10）：Claude CLI `-p` 模式**自动加载用户级 MCP server**（Notion/Gmail/...），导致 tool loop 在两套 MCP 交叉时 hang 5+ 分钟。`--strict-mcp-config --mcp-config <empty>` 隔离
+- **reviewer peer 识别泛化**（D11）：Director 命名 producer 为 "analyzer" 不匹配 writer 关键字，team_context 找不到 peer 就静默跳过 capability block。fallback 到 `execution_order[0]` + 新增 source-bounded 评审规则（registry tools 限定下不苛求源外细节）
+
+真实端到端验证：跑 `@modelcontextprotocol/server-filesystem` + 任务"读 demo.txt 并总结"。Director 自动分配 `read_text_file` 给 analyst，工具 9ms 返回真实内容，reviewer 一轮 SUCCESS，总耗时 85s。
+
 ---
 
 ## 3. 关键架构决策（Decision Log）
@@ -234,6 +255,50 @@ Evaluation rules for THIS run (tool-aware):
 
 **理由**：A 在后端耗资源、前端难渲染、对调试没多大帮助（LLM token 流是线性的，没有结构信息）。B 太粗，看不到工具调用和 review loop 内部节奏。C 是"用户关心的就是这些"——每个状态变化都值得渲染一张卡片。
 
+### D9 · MCP client 的 reader-task pattern
+**问题**：JSON-RPC 客户端怎么处理并发请求 + server 主动通知？
+
+**候选**：
+- (A) 请求后 `await transport.readline()` 拿下一行当响应
+- (B) 每次请求起一个独立 `readline` task
+- (C) 一个后台 task 消费所有字节，按 id 路由到 Futures
+
+**选择**：C。
+
+**理由**：A 有两个致命缺陷——server 在响应前先发 notification（log/progress）时，`readline` 拿到的是 notification 不是响应；并发请求会互相阻塞。B 的问题是多个 readline 之间谁先拿到响应不确定，可能 A 请求的响应被 B 的 readline 抢走。C 把"读"和"请求"解耦：每个请求持有一个 Future，reader 按 id 给对应 Future `set_result`。这是 HTTP/2 stream multiplexing 的同构模式。
+
+**代价**：close 时必须 fail 所有 pending Futures，避免调用方永久挂起。`test_close_cancels_pending_requests` 和 `test_server_eof_fails_pending_requests` 守住这条不变量。
+
+### D10 · Claude CLI MCP 隔离
+**问题**：CLI 模式下 `claude -p` 会**自动加载用户级 MCP server**（Notion/Gmail/oh-my-claudecode/...），当我们同时把自己的 MCP registry 也塞进 tool loop 时，两套 MCP 语义混乱，Claude CLI 进入内部 tool round 等网络 IO 永不返回（观测到 5+ 分钟 hang、CPU 接近 0）。
+
+**候选**：
+- (A) 忽略——反正 API 模式能跑就行
+- (B) 给 `claude -p` 加 `--strict-mcp-config --mcp-config <empty>`，强制只用空配置
+- (C) 用 `--bare` 模式，跳过所有 hooks/plugin/MCP
+
+**选择**：B。
+
+**理由**：A 不可接受——CLI 模式是不需要 API key 就能跑的核心卖点。C 副作用太大，`--bare` 会同时强制 `ANTHROPIC_API_KEY` 作为唯一认证（禁用 OAuth 和 keychain），正好和"CLI 模式 = 不需要 API key"的目标背道而驰。B 精准——只隔离 MCP，保留 OAuth 认证、hooks、settings。实测空配置下 `claude -p` 秒级返回，hang 彻底消除。
+
+**代价**：每次 CLI 调用多两个参数（`--strict-mcp-config --mcp-config <path>`）+ 一个临时 JSON 文件。值得。
+
+### D11 · team_context peer 识别的 fallback + source-bounded 评审
+**问题**：reviewer 的 tool-aware 规则依赖识别"队友里的 producer"，但识别靠关键字（writer/write/author/撰写/...）。当 Director 命名 "analyzer" / "analyst" / "summarizer" 时，关键字匹配不到，capability block 被静默跳过，reviewer 回到"通用严格评审"模式，面对"读文件总结"这类任务仍然要求"必须引用 IDC/Gartner"。
+
+**候选**：
+- (A) 不断扩充关键字列表
+- (B) 关键字失败时回退到 `execution_order[0]`
+- (C) 让 Director 在 plan 里显式标注 agent 的 `role` 字段
+
+**选择**：B。
+
+**理由**：A 是 losing battle——Director 每次可能用新名字；穷举不现实。C 需要协议改动（TeamPlan 加字段），且要让 Director 可靠填它。B 最小改动：review_loop 里 `execution_order[0]` 语义上**永远**是 producer。在关键字匹配失败时 fallback，保留原先的匹配优先级作为快路径。
+
+**同时加强**：当识别到的 producer 拿的是 registry tools（如 `read_text_file`）时，reviewer 规则额外明确"你的知识受源材料边界约束，不要苛求源外细节；若 draft 显式声明 Limitations/Scope，视作正确 scoping，返回 SUCCESS"。这样面对"读文件总结"这类 input-bounded 任务，reviewer 不会陷入"要求源外技术细节"的死循环。
+
+**代价**：reviewer prompt 正在变成"各种情境下的评审手册"。长期看需要抽成独立的 reviewer policy module。
+
 ---
 
 ## 4. 偏离原路线图之处
@@ -255,7 +320,8 @@ Evaluation rules for THIS run (tool-aware):
 ## 5. 待改进 / 未解问题
 
 ### 5.1 未完成
-- **Phase 3C**：接入真实外部 MCP server（filesystem → web search via MCP → Notion）。引擎层已完全准备好（`ToolRegistry` 的 handler 签名天然兼容 MCP 的 `tools/call` RPC），缺的是 `mcp_client.py` 的 stdio/SSE 协议实现和进程管理。
+- **MCP SSE transport**：目前只支持 stdio。用户 Claude CLI 连接的 Notion / Gmail / Calendar 等云端 MCP server 走 SSE 协议，接入需要在 `mcp_client.py` 加一个 `SSETransport` 实现。
+- **UI MCP pool panel**：`/api/mcp/wanxiang-pool` endpoint 已有，但前端还没展示 Wanxiang 自己 spawn 了哪些 server / 注册了哪些工具。
 - **LICENSE 文件**：README 里声明了 MIT，但仓库里还没实际的 LICENSE 文件。
 - **深色模式**：前端只有亮色。
 
@@ -290,17 +356,21 @@ Evaluation rules for THIS run (tool-aware):
 学习代码时的推荐阅读顺序：
 
 1. `wanxiang/core/message.py` —— 最短、最基础，先读完
-2. `wanxiang/core/agent.py` —— BaseAgent 的 execute 主循环 + tool loop
-3. `wanxiang/core/factory.py` —— Director 怎么规划 + policy 兜底
+2. `wanxiang/core/agent.py` —— BaseAgent 的 execute 主循环 + tool loop + team_context
+3. `wanxiang/core/factory.py` —— Director 怎么规划 + policy 兜底 + tool 展示分组
 4. `wanxiang/core/pipeline.py` —— 三种 workflow 怎么编排
-5. `wanxiang/core/tools.py` + `builtin_tools.py` —— 工具注册和执行机制
-6. `wanxiang/core/llm_client.py` —— 双后端 + mode 解析
-7. `wanxiang/server/runner.py` —— 把引擎事件转成前端事件流
-8. `wanxiang/server/app.py` —— FastAPI endpoints + WebSocket
-9. `wanxiang-ui.jsx` —— 前端单文件，读完前 300 行的 helpers 就能跳着看
+5. `wanxiang/core/tools.py` + `builtin_tools.py` —— 工具注册和执行机制（group / allowed_agents）
+6. `wanxiang/core/mcp_client.py` —— JSON-RPC 2.0 + stdio transport + reader-task pattern
+7. `wanxiang/core/mcp_bridge.py` —— MCP tools → ToolSpec（schema 透传）
+8. `wanxiang/core/mcp_loader.py` —— YAML 解析 + MCPPool 生命周期
+9. `wanxiang/core/llm_client.py` —— 双后端 + mode 解析 + CLI MCP 隔离
+10. `wanxiang/server/runner.py` —— 把引擎事件转成前端事件流
+11. `wanxiang/server/app.py` —— FastAPI endpoints + WebSocket + lifespan 绑定 MCPPool
+12. `wanxiang-ui.jsx` —— 前端单文件，读完前 300 行的 helpers 就能跳着看
 
 测试代码（`tests/`）按核心程度：
 - `test_message.py` / `test_pipeline.py` / `test_factory.py` —— 核心行为
-- `test_tools.py` / `test_agent_tools.py` —— 工具系统完整边界
+- `test_tools.py` / `test_agent_tools.py` —— 工具系统完整边界 + reviewer capability block
+- `test_mcp_client.py` / `test_mcp_bridge.py` / `test_mcp_loader.py` —— MCP 协议、桥接、生命周期
 - `test_llm_client_modes.py` / `test_mcp_status.py` —— 基础设施
 - `test_server_events.py` / `test_runner_tool_events.py` —— 事件流一致性
