@@ -59,6 +59,15 @@ class RunManager:
     def has_run(self, run_id: str) -> bool:
         return run_id in self._runs
 
+    async def read_raw_history(self) -> list[dict[str, Any]]:
+        """Return every persisted run record, events included.
+
+        Trace mining needs full event streams (not the summaries that
+        `list_runs` returns). Reads from disk; does not include runs
+        that are still in-flight.
+        """
+        return await asyncio.to_thread(self._read_history_records)
+
     async def list_runs(self, limit: int = 10) -> list[dict[str, Any]]:
         max_items = max(1, limit)
         records = await asyncio.to_thread(self._read_history_records)

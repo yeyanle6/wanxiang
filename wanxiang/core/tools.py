@@ -151,6 +151,15 @@ class ToolRegistry:
     def list_tools(self) -> list[str]:
         return list(self._tools.keys())
 
+    def get_tool_groups(self) -> dict[str, str]:
+        """Return a ``{tool_name: group}`` map for all registered tools.
+
+        Used by trace mining to classify tools into builtin / mcp /
+        synthesized buckets without having to replicate the registry's
+        grouping logic.
+        """
+        return {name: spec.group for name, spec in self._tools.items()}
+
     def filter_for_agent(self, allowed: list[str]) -> list[ToolSpec]:
         seen: set[str] = set()
         filtered: list[ToolSpec] = []

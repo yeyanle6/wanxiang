@@ -10,11 +10,14 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 
+from datetime import datetime
+
 from ..core.agent import AgentConfig, BaseAgent
 from ..core.builtin_tools import create_default_registry
 from ..core.mcp_loader import MCPPool, load_mcp_declarations
 from ..core.sandbox import SandboxExecutor
 from ..core.skill_forge import SkillForge
+from ..core.trace_mining import mine_traces
 from .mcp_status import probe_mcp_status
 from .models import (
     MCPStatusResponse,
@@ -22,6 +25,7 @@ from .models import (
     RunListResponse,
     RunRequest,
     RunResponse,
+    TraceMiningResponse,
 )
 from .runner import RunManager
 
@@ -267,6 +271,53 @@ async def get_tool_audit_log(
         "records": records,
         "total_returned": len(records),
     }
+
+
+@app.get("/api/trace/mining", response_model=TraceMiningResponse)
+async def get_trace_mining(
+    after: str | None = Query(default=None, description="ISO-8601 lower bound."),
+    before: str | None = Query(default=None, description="ISO-8601 upper bound."),
+) -> TraceMiningResponse:
+    """Aggregate `runs.jsonl` + tool audit + synthesis log into a report.
+
+    Pure static analysis: no LLM calls, no event replay. Supports
+    optional ``?after=`` / ``?before=`` ISO-8601 filters. The report
+    shape is stable — the future LLM-based miner agent will consume
+    the same JSON.
+    """
+    rm = _get_run_manager()
+    after_dt = _parse_query_datetime("after", after)
+    before_dt = _parse_query_datetime("before", before)
+
+    runs = await rm.read_raw_history()
+
+    registry = getattr(rm.factory, "tool_registry", None)
+    audit_log = registry.get_audit_log() if registry is not None else []
+    tool_groups = registry.get_tool_groups() if registry is not None else {}
+
+    synthesis_log = list(getattr(rm.factory, "synthesis_log", []) or [])
+
+    report = mine_traces(
+        runs,
+        audit_log=audit_log,
+        synthesis_log=synthesis_log,
+        tool_groups=tool_groups,
+        after=after_dt,
+        before=before_dt,
+    )
+    return TraceMiningResponse(**report.to_dict())
+
+
+def _parse_query_datetime(param_name: str, raw: str | None) -> datetime | None:
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid ISO-8601 timestamp for '{param_name}': {raw}",
+        ) from exc
 
 
 @app.websocket("/api/runs/{run_id}/events")
