@@ -11,6 +11,12 @@ DEFAULT_MODEL = "claude-sonnet-4-20250514"
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 VALID_LLM_MODES = {"auto", "api", "cli"}
 
+# Hard timeout for a single LLM call. Applies uniformly to both API and
+# CLI backends. Normal LLM calls rarely exceed 60s; 120s gives a 2x
+# buffer for occasional slow responses but bounds silent TPM-rate-limit
+# holds that would otherwise stall parallel workflows for 15+ minutes.
+DEFAULT_LLM_CALL_TIMEOUT_S = 120.0
+
 # Claude CLI auto-loads user-level MCP servers (Notion / Gmail / etc.).
 # When Wanxiang uses `claude -p` as a text-generation backend we don't
 # want that — our own tools/loops are separately orchestrated and having
@@ -18,6 +24,26 @@ VALID_LLM_MODES = {"auto", "api", "cli"}
 # The workaround is --strict-mcp-config + an empty config file so
 # Claude CLI starts with zero MCP servers.
 _WANXIANG_EMPTY_MCP_CONFIG_PATH: str | None = None
+
+
+async def _terminate_subprocess(process: "asyncio.subprocess.Process") -> None:
+    """Best-effort kill of a subprocess and reap it.
+
+    Used when outer wait_for cancels a CLI call — we must not leave
+    orphaned `claude -p` processes eating TPM quota after timeout.
+    """
+    if process.returncode is not None:
+        return
+    try:
+        process.kill()
+    except ProcessLookupError:
+        return
+    except Exception:
+        pass
+    try:
+        await process.wait()
+    except Exception:
+        pass
 
 
 def _ensure_empty_mcp_config() -> str:
@@ -44,6 +70,7 @@ class LLMClient:
         api_key: str | None = None,
         oauth_token: str | None = None,
         mode: str | None = None,
+        llm_call_timeout_s: float = DEFAULT_LLM_CALL_TIMEOUT_S,
     ) -> None:
         self.model = model
         self.max_tokens = max_tokens
@@ -55,7 +82,10 @@ class LLMClient:
             raise ValueError(
                 f"Invalid LLM mode '{resolved_mode}'. Expected one of: {', '.join(sorted(VALID_LLM_MODES))}."
             )
+        if llm_call_timeout_s <= 0:
+            raise ValueError("llm_call_timeout_s must be positive")
         self.mode = resolved_mode
+        self.llm_call_timeout_s = llm_call_timeout_s
         self._claude_bin = shutil.which("claude")
         self._cli_auth_cache: bool | None = None
 
@@ -77,6 +107,28 @@ class LLMClient:
         tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         mode = await self.resolve_mode(require_tools=bool(tools))
+        try:
+            return await asyncio.wait_for(
+                self._dispatch_generate_response(
+                    mode=mode, messages=messages, system=system, tools=tools
+                ),
+                timeout=self.llm_call_timeout_s,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"LLM call exceeded {self.llm_call_timeout_s:.0f}s timeout. "
+                f"Likely TPM rate-limit hold (CLI mode) or service degradation. "
+                f"Mode: {mode}, Model: {self.model}"
+            ) from exc
+
+    async def _dispatch_generate_response(
+        self,
+        *,
+        mode: str,
+        messages: list[dict[str, Any]],
+        system: str | None,
+        tools: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
         if mode == "api":
             return await self._generate_response_via_anthropic_api(
                 messages=messages,
@@ -222,7 +274,14 @@ class LLMClient:
             stderr=asyncio.subprocess.PIPE,
             env=env,
         )
-        stdout, stderr = await process.communicate(input=prompt.encode("utf-8"))
+        try:
+            stdout, stderr = await process.communicate(input=prompt.encode("utf-8"))
+        except asyncio.CancelledError:
+            # Outer wait_for cancellation. Kill the orphan so it doesn't
+            # keep consuming TPM or leave zombies behind. Re-raise so the
+            # wait_for path can convert to a timeout RuntimeError.
+            await _terminate_subprocess(process)
+            raise
 
         out_text = stdout.decode("utf-8", errors="replace").strip()
         err_text = stderr.decode("utf-8", errors="replace").strip()
@@ -267,7 +326,11 @@ class LLMClient:
             stderr=asyncio.subprocess.PIPE,
             env=env,
         )
-        stdout, _ = await process.communicate(input=prompt.encode("utf-8"))
+        try:
+            stdout, _ = await process.communicate(input=prompt.encode("utf-8"))
+        except asyncio.CancelledError:
+            await _terminate_subprocess(process)
+            raise
         if process.returncode != 0:
             return ""
 
