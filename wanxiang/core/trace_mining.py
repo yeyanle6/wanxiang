@@ -37,6 +37,7 @@ from typing import Any, Iterable
 # ---------------------------------------------------------------------------
 
 DEFAULT_FAILURE_KEYWORDS: tuple[str, ...] = (
+    "LLM call exceeded",         # hard-timeout firing (TPM hold, slow backend)
     "Exceeded max_tool_rounds",
     "Exceeded max_retries",
     "Tool timed out",
