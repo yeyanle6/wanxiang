@@ -544,6 +544,26 @@ class AgentFactory:
                         tool_spec.allowed_agents,
                     )
             spec.allowed_tools = kept
+
+        # Tool-using agents need headroom: real tasks often mean 5-20 tool
+        # rounds (batch conversions, sequential lookups, retry after partial
+        # data). Director tends to copy the default "5" from the planner
+        # example and leaves tool-heavy agents starved. Lift the floor so
+        # one unexpectedly long batch does not truncate the whole run.
+        MIN_ROUNDS_FOR_TOOL_USERS = 15
+        for spec in plan.agents:
+            has_tools = bool(spec.allowed_tools) or bool(spec.native_tools)
+            if not has_tools:
+                continue
+            current = spec.max_tool_rounds
+            if current is None or current < MIN_ROUNDS_FOR_TOOL_USERS:
+                self.logger.info(
+                    "Lifting max_tool_rounds for tool-using agent '%s': %s → %d",
+                    spec.name,
+                    current,
+                    MIN_ROUNDS_FOR_TOOL_USERS,
+                )
+                spec.max_tool_rounds = MIN_ROUNDS_FOR_TOOL_USERS
         return plan
 
     def _parse_json_response(self, raw_text: str) -> dict[str, Any]:

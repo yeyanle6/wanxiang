@@ -717,6 +717,96 @@ def test_synthesis_stage_without_forge_logs_warning_and_proceeds() -> None:
     assert "SkillForge" in (entry["error"] or "")
 
 
+def test_tool_users_get_max_tool_rounds_lifted_to_floor() -> None:
+    """Director often leaves tool-heavy agents with the default max_tool_rounds=5,
+    which truncates realistic batch workloads. Policy lifts the floor."""
+    registry = ToolRegistry()
+    registry.register(
+        _spec("tool_a", description="tool A"),
+    )
+    factory = _make_factory(tool_registry=registry)
+    plan = TeamPlan.from_dict(
+        {
+            "workflow": "pipeline",
+            "execution_order": ["worker", "reviewer"],
+            "agents": [
+                {
+                    "name": "worker",
+                    "duty": "use tools a lot",
+                    "base_identity": "You use tools.",
+                    "allowed_tools": ["tool_a"],
+                    "max_tool_rounds": 3,  # Director's undersized guess
+                },
+                {
+                    "name": "reviewer",
+                    "duty": "review",
+                    "base_identity": "You review.",
+                },
+            ],
+        }
+    )
+
+    updated = factory._apply_tool_restrictions(plan)
+    worker = next(a for a in updated.agents if a.name == "worker")
+    reviewer = next(a for a in updated.agents if a.name == "reviewer")
+
+    # Worker has tools → floor applied.
+    assert worker.max_tool_rounds == 15
+    # Reviewer has no tools → untouched (None).
+    assert reviewer.max_tool_rounds is None
+
+
+def test_tool_users_keep_their_explicit_high_max_tool_rounds() -> None:
+    registry = ToolRegistry()
+    registry.register(_spec("tool_a"))
+    factory = _make_factory(tool_registry=registry)
+    plan = TeamPlan.from_dict(
+        {
+            "workflow": "pipeline",
+            "execution_order": ["worker", "reviewer"],
+            "agents": [
+                {
+                    "name": "worker",
+                    "duty": "batch task",
+                    "base_identity": "You do batch.",
+                    "allowed_tools": ["tool_a"],
+                    "max_tool_rounds": 50,  # already high
+                },
+                {"name": "reviewer", "duty": "r", "base_identity": "r"},
+            ],
+        }
+    )
+    updated = factory._apply_tool_restrictions(plan)
+    worker = next(a for a in updated.agents if a.name == "worker")
+    # Preserved, not clamped down.
+    assert worker.max_tool_rounds == 50
+
+
+def test_native_tool_users_also_get_floor_lift() -> None:
+    factory = _make_factory(tool_registry=ToolRegistry())
+    plan = TeamPlan.from_dict(
+        {
+            "workflow": "pipeline",
+            "execution_order": ["researcher", "reviewer"],
+            "agents": [
+                {
+                    "name": "researcher",
+                    "duty": "search a lot",
+                    "base_identity": "You search.",
+                    "native_tools": [
+                        {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
+                    ],
+                    # No max_tool_rounds set → defaults to None in the spec.
+                },
+                {"name": "reviewer", "duty": "r", "base_identity": "r"},
+            ],
+        }
+    )
+    updated = factory._apply_tool_restrictions(plan)
+    researcher = next(a for a in updated.agents if a.name == "researcher")
+    assert researcher.max_tool_rounds == 15
+
+
 def test_synthesis_stage_leaves_tool_in_registry_when_no_agent_requests_it() -> None:
     forge = _ScriptedSkillForge([_ForgeResult(True, "orphan_tool")])
     factory = AgentFactory(
