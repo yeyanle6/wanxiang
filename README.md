@@ -4,7 +4,7 @@
 >
 > **AI 原生的多 Agent 编排引擎** —— Director 动态规划团队执行任意任务，支持三种编排模式、双 LLM 通道与实时可观测 UI。
 
-[![tests](https://img.shields.io/badge/tests-147%20passing-brightgreen)]()
+[![tests](https://img.shields.io/badge/tests-175%20passing-brightgreen)]()
 [![python](https://img.shields.io/badge/python-3.11%2B-blue)]()
 [![license](https://img.shields.io/badge/license-MIT-lightgrey)]()
 
@@ -77,6 +77,7 @@ flowchart TB
 - **MCP status probe**: Built-in endpoint checks `claude auth status` + `claude mcp list` and surfaces the result to the UI
 - **Runtime tool synthesis**: When Director encounters a task needing a capability no existing tool provides, it can request a new tool via `needs_synthesis`. The `SkillForge` spins up a `SynthesizerAgent` → pytest-gated `SandboxExecutor` → on-pass `ToolRegistry.register` loop (with feedback-driven retry). The new tool is instantly available to downstream agents in the same run. Feature-flagged via `WANXIANG_ENABLE_SKILL_FORGE=1`.
 - **Tool safety**: JSON Schema Draft 7 argument validation, UTF-8-safe output truncation (50 KB cap), ring-buffered call audit log (`GET /api/tools/audit`)
+- **Offline trace mining**: `wanxiang.core.trace_mining.mine_traces()` aggregates `runs.jsonl` + tool audit log + synthesis log into a structured `TraceMiningReport` (final-status distribution, workflow mix, keyword-clustered failure patterns, per-tool usage grouped into builtin/native/mcp/synthesized, synthesis success rate, reviewer-convergence buckets, slowest agents, producer naming distribution). Exposed via `GET /api/trace/mining` with optional `?after=` / `?before=` ISO-8601 window filters. Pure static analysis — no LLM calls.
 
 ### Quick Start
 
@@ -141,13 +142,13 @@ Coverage spans Message protocol, three workflow engines, AgentFactory policies, 
 ```
 .
 ├── wanxiang/              # Python package
-│   ├── core/              # Message, BaseAgent, Factory, WorkflowEngine, Tools, LLMClient
+│   ├── core/              # Message, BaseAgent, Factory, WorkflowEngine, Tools, LLMClient, SkillForge, trace_mining
 │   ├── server/            # FastAPI app, RunManager, events, MCP probe
 │   ├── cli.py             # One-shot CLI entry point
 │   └── __main__.py
 ├── configs/agents/        # Example agent YAML configs
 ├── data/                  # Runtime JSONL history (gitignored)
-├── tests/                 # pytest suite (53 tests)
+├── tests/                 # pytest suite (175 tests) + fixtures/
 ├── wanxiang-ui.jsx        # Single-file React UI served by the FastAPI app
 └── README.md
 ```
@@ -158,10 +159,14 @@ Coverage spans Message protocol, three workflow engines, AgentFactory policies, 
 - [x] Phase 3C: external MCP server integration — stdio client (JSON-RPC 2.0), YAML-configured pool, ToolRegistry bridge, Director-aware tool assignment, allowed_agents ACL, and CLI MCP isolation (91 tests). Filesystem verified end-to-end; Notion/SSE pending.
 - [x] Phase 3D: tool hardening — jsonschema-backed validation, UTF-8-safe output cap, ring-buffered audit log with query API (111 tests)
 - [x] Phase 4: runtime tool synthesis — process-isolated `SandboxExecutor`, `SkillForge` generate→test→feedback→retry loop, Director `needs_synthesis` protocol, policy floor for tool-using agents (147 tests). End-to-end verified: Director declares a gap → LLM emits handler+tests → sandbox runs pytest → handler registered → agent calls it via tool_use and returns correct data.
+- [x] Phase 5: offline trace mining — pure data layer (`wanxiang.core.trace_mining`) consumes `runs.jsonl` + audit log + synthesis log; `GET /api/trace/mining` endpoint with `?after=` / `?before=` filters; Pydantic response schema; hand-authored fixture suite + 28 tests (175 total). Verified on real production data: surfaces reviewer-convergence gaps, CLI-auth infra errors, and "unknown" tool-group buckets (which exposed the next dependency — synthesized tool persistence).
 - [x] Packaging: `pyproject.toml` with `pip install -e ".[dev]"`
 - [x] UI polish: WebSocket event loss fix, bilingual region naming (dark mode pending)
 - [x] `ProjectGuide.md` — architecture evolution log
-- [ ] Trace mining: offline agent analyzes `runs.jsonl` to surface failure patterns and policy-tuning suggestions (next)
+- [ ] Synthesized tool persistence: write handler + tests to a reviewed `skills/` dir, auto-load on startup. Closes the "group=unknown" and "synthesis_stats=0 after restart" gaps that trace mining exposed (next)
+- [ ] UI panels for `/api/mcp/wanxiang-pool`, `/api/skill-forge/status`, and `/api/trace/mining`
+- [ ] MCP SSE transport (Notion / Gmail / Calendar via remote MCP servers)
+- [ ] Prompt self-tuning agent: LLM interpreter on top of trace mining — deferred until `runs.jsonl` accumulates ≥50 real (non-infra-error) runs for statistical signal
 
 ---
 
@@ -185,6 +190,7 @@ Coverage spans Message protocol, three workflow engines, AgentFactory policies, 
 - **MCP 状态探测**：内置端点检查 `claude auth status` + `claude mcp list`，结果呈现在 UI
 - **运行时工具合成**：Director 遇到现有工具无法满足的能力时，可通过 `needs_synthesis` 请求合成新工具。`SkillForge` 驱动 `SynthesizerAgent` → 经过 pytest 验证的 `SandboxExecutor` → 通过后 `ToolRegistry.register` 的闭环（失败时带反馈重试）。合成的工具当轮 run 内即可被下游 Agent 调用。通过 `WANXIANG_ENABLE_SKILL_FORGE=1` 开启
 - **工具安全**：JSON Schema Draft 7 参数校验、UTF-8 安全输出截断（50KB 上限）、ring-buffered 调用审计日志（`GET /api/tools/audit`）
+- **离线 trace mining**：`wanxiang.core.trace_mining.mine_traces()` 聚合 `runs.jsonl` + 工具审计日志 + 合成日志，产出结构化的 `TraceMiningReport`（final_status 分布、workflow 分布、关键词聚类的失败模式、按 builtin/native/mcp/synthesized 分组的工具使用、合成成功率、reviewer 收敛分桶、最慢 Agent、producer 命名分布）。通过 `GET /api/trace/mining` 暴露，支持 `?after=` / `?before=` ISO-8601 窗口过滤。纯静态分析，零 LLM 调用。
 
 ### 快速开始
 
@@ -249,13 +255,13 @@ pytest -q
 ```
 .
 ├── wanxiang/              # Python 包
-│   ├── core/              # Message、BaseAgent、Factory、WorkflowEngine、Tools、LLMClient
+│   ├── core/              # Message、BaseAgent、Factory、WorkflowEngine、Tools、LLMClient、SkillForge、trace_mining
 │   ├── server/            # FastAPI app、RunManager、事件、MCP 探测
 │   ├── cli.py             # 一次性 CLI 入口
 │   └── __main__.py
 ├── configs/agents/        # 示例 agent YAML 配置
 ├── data/                  # 运行时 JSONL 历史（已 gitignore）
-├── tests/                 # pytest 测试（53 个）
+├── tests/                 # pytest 测试（175 个）+ fixtures/
 ├── wanxiang-ui.jsx        # FastAPI 提供的单文件 React UI
 └── README.md
 ```
@@ -266,10 +272,14 @@ pytest -q
 - [x] Phase 3C：接入真实外部 MCP server —— stdio 客户端（JSON-RPC 2.0）、YAML 配置的 pool、ToolRegistry 桥接、Director 工具感知、allowed_agents ACL、CLI MCP 隔离（91 个测试）。filesystem 端到端验证通过；Notion / SSE 待做。
 - [x] Phase 3D：工具加固 —— jsonschema 校验、UTF-8 安全输出截断、环形调用审计 + 查询 API（111 个测试）
 - [x] Phase 4：运行时工具合成 —— 进程隔离的 `SandboxExecutor`、`SkillForge` 生成→测试→反馈→重试闭环、Director `needs_synthesis` 协议、工具型 agent 的 policy 下限（147 个测试）。端到端验证通过：Director 识别工具缺口 → LLM 输出 handler+测试 → sandbox 跑 pytest → 通过则注册 → agent 在 workflow 里调用并返回正确结果。
+- [x] Phase 5：离线 trace mining —— 纯数据层（`wanxiang.core.trace_mining`）消费 `runs.jsonl` + 审计日志 + synthesis_log；`GET /api/trace/mining` endpoint 带 `?after=` / `?before=` 过滤；Pydantic response schema；手写 fixture + 28 个测试（累计 175 个）。真实生产数据验证通过：定位到 reviewer 收敛率缺口、CLI 认证 infra 错误、以及 "group=unknown" 工具分类问题（后者直接暴露了下一步的依赖——合成工具持久化）。
 - [x] 打包：`pyproject.toml` + `pip install -e ".[dev]"`
 - [x] UI 润色：WebSocket 事件丢失修复、区域命名中英化（深色模式待做）
 - [x] `ProjectGuide.md` —— 架构演进记录
-- [ ] Trace mining：离线 agent 分析 `runs.jsonl`，发现失败模式并提 policy 调优建议（下一步）
+- [ ] 合成工具持久化：把 handler + 测试写入经人工审核的 `skills/` 目录，启动时自动加载。解决 trace mining 暴露的 "group=unknown" 和 "重启后 synthesis_stats 归零" 问题（下一步）
+- [ ] UI 面板接入 `/api/mcp/wanxiang-pool`、`/api/skill-forge/status`、`/api/trace/mining`
+- [ ] MCP SSE transport（接入 Notion / Gmail / Calendar 等云端 MCP server）
+- [ ] Prompt self-tuning agent：基于 trace mining 的 LLM 解读层 —— 延后至 `runs.jsonl` 积累 ≥50 个真实 run（排除 infra error）后再做，以保证统计显著性
 
 ---
 

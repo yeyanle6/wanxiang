@@ -189,6 +189,30 @@ Evaluation rules for THIS run (tool-aware):
 
 **没有人写一行中文数字转换的代码**。这是 Level 1 能力组合式自进化的首次实现。
 
+### Phase 5：离线 trace mining（Level 2 的观察层）
+**目标**：系统积累了几十个 run 之后，人眼已经看不出规律了。需要一个离线的数据聚合层，把 `runs.jsonl` + 工具审计日志 + synthesis_log 压缩成结构化报告，回答"系统在哪些地方反复失败 / 哪些工具没人用 / reviewer 收敛得如何"这类问题。这是 Level 2 自进化的**观察部分**——LLM 解读层（prompt self-tuning）要等数据积累够了再做。
+
+关键文件：
+- `wanxiang/core/trace_mining.py` —— `TraceMiningReport` dataclass + `mine_traces()` 纯函数（22 tests）
+- `wanxiang/server/app.py` —— `GET /api/trace/mining` endpoint（6 tests）
+- `wanxiang/server/models.py` —— Pydantic response schema 镜像 `TraceMiningReport` 结构
+- `tests/fixtures/trace_mining/` —— 手写 5 个 run + 审计日志 + 合成日志 fixture
+
+分两个 commit 递进：
+
+**5.1 数据层**：`TraceMiningReport` 9 个维度（final_status 分布 / workflow mix / 关键词聚类失败模式 / 按 group 分类的工具使用 / synthesis 成功率 / agent naming 分布 / slowest agents / reviewer 收敛桶 / 时间窗口信息）。关键设计决策（见 D15）：**关键词匹配而非语义聚类**（LLM 贵且不稳）、**tool_groups 可选 map**（让调用者注入分类而非硬编码）、**extra_failure_keywords 可扩展**（新失败模式不改源码）、**after/before 窗口过滤**（避免 `runs.jsonl` 膨胀后全量扫描）。22 个测试覆盖每个维度、窗口过滤、JSON 可序列化、空输入边界。
+
+**5.2 Endpoint**：`GET /api/trace/mining?after=&before=` 走 Pydantic response model。支撑改动极小——`ToolRegistry.get_tool_groups()` 导出 `{name: group}`、`RunManager.read_raw_history()` 公开历史读取。6 个端点测试用 fake RunManager 直调 handler 协程，绕开真实 lifespan 的 MCP 子进程启停（`wanxiang.server.__init__` 把 `app` 重绑定成 FastAPI 实例，需要走 `sys.modules["wanxiang.server.app"]` 拿到模块本身）。
+
+**真实生产数据验证**（23 个真实 run 首次自省）：
+- `reviewer_convergence` 暴露 **8 个 review_loop 里 4 个 never_converged**（50%）——比预期差，值得专项分析
+- `tool_usage` 里 `chinese_numeral_to_int` 显示为 `group=unknown`——不是 mining bug，是"合成工具跨进程不持久化"的必然后果。Mining 在这里的价值**恰恰是让一个未完成功能的必要性浮出水面**
+- `synthesis_stats=0` 同源——`factory.synthesis_log` 只在进程内存里
+- `agent_naming` 统计实锤了 D11 fallback 的价值：Director 实际用过 `analyzer` / `analyst` / `converter` / `time_writer` / `writer` / `synthesizer`，光靠 writer 关键字根本覆盖不全
+- `common_failure_patterns` 顶部两位都是 "Claude CLI call failed" / "Not logged in" 各 6 次——开发期 CLI 认证断过一段时间。提示未来可以加一层 `infra_errors` vs `logic_errors` 分桶
+
+这是项目第一次用 mining 数据反过来驱动开发决策："合成工具持久化"从 Phase 4 的 nice-to-have 变成下一阶段的首位 backlog，理由不是主观判断而是客观观测。
+
 ---
 
 ## 3. 关键架构决策（Decision Log）
@@ -391,6 +415,32 @@ Evaluation rules for THIS run (tool-aware):
 
 **代价**：15 是个经验魔数。未来可能需要按 tool 类型分级（web_search 重、echo 轻）。不急着做。
 
+### D15 · Trace mining：纯数据层先行，LLM 解读层延后
+**问题**：Phase 5 的目标是"让系统观察自己"。最直觉的做法是写一个 meta-agent，吃完整的 `runs.jsonl` 直接用 LLM 产自然语言洞察。但这样做之前要回答：数据从哪来？怎么保证洞察有统计显著性？
+
+**候选**：
+- (A) 直接上 meta-agent：读 JSONL → 调 LLM → 输出"系统分析报告"
+- (B) 先做**纯数据聚合层**输出结构化 `TraceMiningReport`，meta-agent 留到数据足够再做
+- (C) 混合：数据层 + 一个薄 LLM 层马上套上去
+
+**选择**：B。
+
+**理由**：
+1. **LLM 层的价值由输入数据质量决定**。当时 `runs.jsonl` 只有 23 个 run，其中 13 个是 CLI 认证 infra error——有效样本太少，LLM 再聪明也只能产生泛泛之论。B 让 LLM 层在有足够信号时再做，不在数据稀疏时浪费调用
+2. **纯数据层立刻可用**——`curl /api/trace/mining | jq .` 直接能看清系统状态，前端 dashboard 也能直接渲染。不需要任何 LLM 就有价值
+3. **CI 稳定**。纯函数 + dataclass 可以跑 22 个精准测试覆盖每个维度；LLM 层的测试必然松（只能 assert "提到了 reviewer" 这种模糊条件）
+4. **给 LLM 层提供稳定输入契约**。未来的 meta-agent 消费的是 `TraceMiningReport` 的 JSON schema，不是 raw JSONL——数据层变更时 LLM 层不用跟改 prompt
+
+**关键设计选择**（都在 D15 这条决策之内，不单独开条目）：
+- **关键词聚类 over 语义聚类**：`DEFAULT_FAILURE_KEYWORDS` 是我们真实遇到过的错误字符串（`Exceeded max_tool_rounds` / `Claude CLI call failed` / `Not logged in` / ...），literal 匹配 + Counter 排序。语义聚类要等 LLM 层做
+- **`tool_groups` 可选注入 map**：不在 mining 里硬编码"哪些工具是 MCP / 哪些是 synthesized"，让调用者从 `ToolRegistry.get_tool_groups()` 传进来。Mining 只做聚合，不做分类
+- **`extra_failure_keywords` 可扩展**：新失败模式可以在调用时追加，不必改源码
+- **时间窗口过滤**：`runs.jsonl` 无轮转会膨胀，`after` / `before` 保证 mining 永远可用
+
+**代价**：短期看"少了 AI 含量"——纯统计不如自然语言报告酷。但长期看这是唯一对的做法。等 `runs.jsonl` 积累 50+ 真实 run、infra_errors 和 logic_errors 能分开后，meta-agent 再上场会产出质量高得多的洞察。
+
+**测试验证**：`test_default_failure_keywords_nonempty` + `test_extra_failure_keywords_are_honored` + `test_tool_classification_distinguishes_native_mcp_synthesized` 守住 D15 的三个可扩展性保证。
+
 ---
 
 ## 4. 偏离原路线图之处
@@ -412,10 +462,10 @@ Evaluation rules for THIS run (tool-aware):
 ## 5. 待改进 / 未解问题
 
 ### 5.1 未完成
-- **Trace mining agent**（下一步）：离线 agent 分析 `runs.jsonl`，发现重复出现的失败模式（reviewer 频繁苛求、某类任务反复重试、某个 synthesized tool 被多次重新合成）并输出 policy 调优建议。工具层数据已经准备好（Phase 3D Step 3 的审计日志 + Phase 4 的 synthesis_log），缺的是消费者
-- **Synthesized tool 持久化**：目前合成的工具只在当前 run 内生效。需要把 `handler_code` + `test_code` 写入 `skills/` 目录 + 人工审核流程（审核后持久化，下次启动自动加载）
+- **Synthesized tool 持久化**（下一步，由 Phase 5 mining 数据直接驱动）：目前合成的工具只在当前 run 内生效。需要把 `handler_code` + `test_code` 写入 `skills/` 目录 + 人工审核流程（审核后持久化，下次启动自动加载）。Mining 报告里反复出现的 `group=unknown` 和 `synthesis_stats=0 after restart` 就是这个缺口的客观信号
+- **Prompt self-tuning agent**（Level 2 的解读层）：trace mining 的 LLM 消费者，基于 `TraceMiningReport` 产出 policy 调优建议。按 D15，延后至 `runs.jsonl` 积累 ≥50 个真实（非 infra error）run 后再做
+- **UI 面板接入 mining / MCP pool / SkillForge 状态**：endpoint 都在（`/api/trace/mining` / `/api/mcp/wanxiang-pool` / `/api/skill-forge/status`），前端还没展示
 - **MCP SSE transport**：目前只支持 stdio。用户 Claude CLI 连接的 Notion / Gmail / Calendar 等云端 MCP server 走 SSE 协议，接入需要在 `mcp_client.py` 加一个 `SSETransport` 实现
-- **UI MCP pool panel + SkillForge 可视化**：`/api/mcp/wanxiang-pool` 和 `/api/skill-forge/status` endpoint 已有，但前端还没展示 Wanxiang 自己 spawn 了哪些 server、注册了哪些工具、最近合成了什么
 - **LICENSE 文件**：README 里声明了 MIT，但仓库里还没实际的 LICENSE 文件
 - **深色模式**：前端只有亮色
 
@@ -423,7 +473,8 @@ Evaluation rules for THIS run (tool-aware):
 - **Policy 层膨胀**：`factory.py` 的 policy 逻辑已 200+ 行，未来需要拆成独立的 `policies.py`，支持 pluggable 规则。
 - **CLI 模式无 native tools**：这不是能修的 bug，是协议限制。team_context 的补丁让它可用但不理想，长期看需要鼓励用户配 API key。
 - **无认证**：FastAPI server 没有 auth 层，任何能访问 8000 端口的人都能创建 run。个人/本地用场景下 OK，正式部署前需要加。
-- **JSONL history 无上限**：`data/runs.jsonl` 会无限增长。需要加轮转或者清理策略。
+- **JSONL history 无上限**：`data/runs.jsonl` 会无限增长。Phase 5 mining 的 `after` / `before` 窗口过滤让这个问题在读侧可控，但落盘侧仍需要加轮转或清理策略。
+- **Failure 分类粒度**：mining 的 `common_failure_patterns` 目前把 infra error（CLI 认证）和 logic error（max_tool_rounds 超限）混在一起。需要加一层 `infra_errors` vs `logic_errors` 分桶，两类问题的修复路径完全不同。
 
 ### 5.3 架构级思考题
 - **多 run 并发**：`RunManager` 是单例，多个 run 能并发跑（每个独立的 `asyncio.Task` 和 queue），但没有压测过。未来如果做 SaaS 版本，需要考虑 Redis 队列 / 多 worker。
@@ -460,15 +511,19 @@ Evaluation rules for THIS run (tool-aware):
 9. `wanxiang/core/mcp_bridge.py` —— MCP tools → ToolSpec（schema 透传）
 10. `wanxiang/core/mcp_loader.py` —— YAML 解析 + MCPPool 生命周期
 11. `wanxiang/core/llm_client.py` —— 双后端 + mode 解析 + CLI MCP 隔离
-12. `wanxiang/server/runner.py` —— 把引擎事件转成前端事件流
-13. `wanxiang/server/app.py` —— FastAPI endpoints + WebSocket + lifespan 绑定 MCPPool + SkillForge
-14. `configs/agents/skill_synthesizer.yaml` —— synthesizer 的 JSON-only 输出契约
-15. `wanxiang-ui.jsx` —— 前端单文件，读完前 300 行的 helpers 就能跳着看
+12. `wanxiang/core/trace_mining.py` —— 纯数据聚合层（9 个维度 / 关键词聚类 / 可插拔分类 / 时间窗口）
+13. `wanxiang/server/runner.py` —— 把引擎事件转成前端事件流
+14. `wanxiang/server/app.py` —— FastAPI endpoints + WebSocket + lifespan 绑定 MCPPool + SkillForge + mining endpoint
+15. `wanxiang/server/models.py` —— Pydantic response schema（含 `TraceMiningResponse` 等）
+16. `configs/agents/skill_synthesizer.yaml` —— synthesizer 的 JSON-only 输出契约
+17. `wanxiang-ui.jsx` —— 前端单文件，读完前 300 行的 helpers 就能跳着看
 
 测试代码（`tests/`）按核心程度：
 - `test_message.py` / `test_pipeline.py` / `test_factory.py` —— 核心行为
 - `test_tools.py` / `test_agent_tools.py` —— 工具系统完整边界 + reviewer capability block
 - `test_sandbox.py` / `test_skill_forge.py` —— Phase 4 自进化层（sandbox 隔离 + forge 闭环）
+- `test_trace_mining.py` / `test_trace_mining_endpoint.py` —— Phase 5 观察层（纯数据聚合 + HTTP endpoint）
 - `test_mcp_client.py` / `test_mcp_bridge.py` / `test_mcp_loader.py` —— MCP 协议、桥接、生命周期
 - `test_llm_client_modes.py` / `test_mcp_status.py` —— 基础设施
 - `test_server_events.py` / `test_runner_tool_events.py` —— 事件流一致性
+- `tests/fixtures/trace_mining/` —— 5 个手写 run + 审计日志 + 合成日志 fixture
