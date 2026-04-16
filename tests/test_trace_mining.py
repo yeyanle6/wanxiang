@@ -169,6 +169,35 @@ def test_unknown_tool_without_classification_is_flagged(runs):
     assert report.tool_usage["web_search"].group == "native"
 
 
+def test_registered_builtin_with_empty_group_is_classified_as_builtin(runs):
+    """Regression: after web_search moved from native-only to a builtin
+    ddgs-backed registry tool, its registry entry has group="" and was
+    being misclassified as `native` because `if explicit:` falls
+    through on falsy strings. The fix uses `tool in tool_groups`
+    membership so explicit registration is always respected."""
+    tool_groups = {
+        "web_search": "",  # builtin convention: empty string group
+        "read_text_file": "filesystem",
+        "chinese_numeral_to_int": "synthesized",
+    }
+    report = mine_traces(runs, tool_groups=tool_groups)
+    assert report.tool_usage["web_search"].group == "builtin"
+    assert report.tool_usage["read_text_file"].group == "mcp"
+    assert report.tool_usage["chinese_numeral_to_int"].group == "synthesized"
+
+
+def test_native_fallback_still_works_when_not_registered(runs):
+    """If a tool name matches _NATIVE_TOOL_NAMES AND it's NOT in the
+    registry (tool_groups map doesn't contain it), fall back to native.
+    This preserves the classifier's original behavior for Claude
+    API-managed tools that have no local registry entry."""
+    tool_groups = {
+        "read_text_file": "filesystem",
+    }  # note: web_search deliberately NOT in map
+    report = mine_traces(runs, tool_groups=tool_groups)
+    assert report.tool_usage["web_search"].group == "native"
+
+
 # ---------------------------------------------------------------------------
 # Synthesis stats
 # ---------------------------------------------------------------------------

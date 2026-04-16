@@ -516,16 +516,25 @@ def _record_failure_patterns(
 
 
 def _classify_tool(tool: str, tool_groups: dict[str, str]) -> str:
-    explicit = tool_groups.get(tool)
-    if explicit:
-        # Normalize a few common labels so downstream consumers see a
-        # stable vocabulary regardless of how the registry labels things.
-        lower = explicit.lower()
+    # Explicit registration wins — `tool in tool_groups` says "this tool
+    # is registered locally in the ToolRegistry", regardless of whether
+    # its group label is empty (the convention for builtin tools).
+    # Before this check the test was `if explicit:` which treated an
+    # empty-string group as "not classified" and fell through to the
+    # _NATIVE_TOOL_NAMES heuristic. That misfired after Phase 7 when
+    # web_search was moved from native-only into the builtin registry:
+    # the registered builtin tool kept showing up as `native` in
+    # mining reports.
+    if tool in tool_groups:
+        lower = (tool_groups[tool] or "").lower()
         if lower in {"", "builtin"}:
             return "builtin"
         if lower == "synthesized":
             return "synthesized"
         return "mcp"  # any non-empty, non-synthesized group comes from an MCP server
+    # Not in the registry — fall back to the name-based heuristic for
+    # Claude-native server-side tools (e.g. a raw `web_search` without
+    # a local registry entry) and a few well-known builtins.
     if tool in _NATIVE_TOOL_NAMES:
         return "native"
     if tool in _BUILTIN_TOOL_NAMES:
