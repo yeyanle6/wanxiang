@@ -6,7 +6,7 @@ from wanxiang.core.builtin_tools import create_default_registry
 
 def test_default_registry_contains_echo_and_current_time() -> None:
     registry = create_default_registry()
-    assert set(registry.list_tools()) == {"echo", "current_time"}
+    assert set(registry.list_tools()) == {"echo", "current_time", "web_search"}
 
 
 def test_default_echo_tool_executes() -> None:
