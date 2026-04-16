@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Pre-commit hook: warn when immutable-core files are about to be committed.
+# Install: git config core.hooksPath .githooks
+#
+# To bypass the guard (after conscious review):
+#   ALLOW_CORE_CHANGE=1 git commit ...
+
+CORE_FILES=(
+  "wanxiang/core/message.py"
+  "wanxiang/core/agent.py"
+  "wanxiang/core/pipeline.py"
+  "wanxiang/core/tools.py"
+  "wanxiang/core/sandbox.py"
+)
+
+staged=$(git diff --cached --name-only)
+touched=()
+
+for file in "${CORE_FILES[@]}"; do
+  if echo "$staged" | grep -qx "$file"; then
+    touched+=("$file")
+  fi
+done
+
+if [ ${#touched[@]} -eq 0 ]; then
+  exit 0
+fi
+
+echo ""
+echo "╔══════════════════════════════════════════════════════════╗"
+echo "║          ⚠  IMMUTABLE CORE FILES MODIFIED  ⚠           ║"
+echo "╠══════════════════════════════════════════════════════════╣"
+
+for f in "${touched[@]}"; do
+  echo "║  • $f"
+done
+
+echo "║                                                          ║"
+echo "║  These files define Wanxiang's safety boundaries.        ║"
+echo "║  Changes require conscious review.                       ║"
+echo "║                                                          ║"
+echo "║  To proceed:  ALLOW_CORE_CHANGE=1 git commit ...        ║"
+echo "║  See IMMUTABLE_CORE.md for protected interfaces.         ║"
+echo "╚══════════════════════════════════════════════════════════╝"
+echo ""
+
+if [ "${ALLOW_CORE_CHANGE}" = "1" ]; then
+  echo "ALLOW_CORE_CHANGE=1 set — proceeding with core change."
+  exit 0
+fi
+
+exit 1
