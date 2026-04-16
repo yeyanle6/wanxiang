@@ -41,14 +41,14 @@
 ### 3. `wanxiang/core/pipeline.py` — 三种 workflow 模式
 
 **受保护的公开接口：**
-- `WorkflowEngine.__init__()` 签名
+- `WorkflowEngine.__init__()` 签名（required: `agents`, `plan`；optional 参数可加可调，但不能改变默认行为）
 - `WorkflowEngine.run()` 签名
 - 三种模式的存在性：`_run_pipeline`, `_run_review_loop`, `_run_parallel`
 - `_validate_plan()` —— 确保 execution_order 里的 agent 都存在
 
-**不受保护**：事件发射的细节、日志格式。
+**不受保护**：事件发射的细节、日志格式、可选 kwarg（例如 Phase 7.2 引入的 `parallel_stagger_s`，默认 8.0，用于平滑 TPM 峰值）。
 
-**理由**：三种 workflow 是万象的编排骨架。可以加第四种，但不能改现有三种的语义。
+**理由**：三种 workflow 是万象的编排骨架。可以加第四种，但不能改现有三种的语义。Phase 7.2 的 `parallel_stagger_s` 只在 `_run_parallel` 内部加 `asyncio.sleep(i * stagger)`，不改变任一 mode 的语义——只是把并发启动从"同一 tick 全发"变成"按间隔依次发"。
 
 ### 4. `wanxiang/core/tools.py` — ToolRegistry 执行 + 安全守卫
 

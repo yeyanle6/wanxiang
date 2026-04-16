@@ -14,16 +14,25 @@ StepCallback = Callable[[Message], Awaitable[None] | None]
 EventCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
+DEFAULT_PARALLEL_STAGGER_S = 8.0
+
+
 class WorkflowEngine:
     def __init__(
         self,
         agents: dict[str, Any],
         plan: TeamPlan,
         on_event: EventCallback | None = None,
+        parallel_stagger_s: float = DEFAULT_PARALLEL_STAGGER_S,
     ) -> None:
         self.agents = agents
         self.plan = plan
         self.on_event = on_event
+        # Stagger delay between parallel-branch launches. Smooths the
+        # burst of simultaneous LLM calls that otherwise trips Claude
+        # Max's per-account TPM limit in CLI mode (silent hold).
+        # 0 disables staggering. See D18 in ProjectGuide.md.
+        self.parallel_stagger_s = max(0.0, parallel_stagger_s)
         self.logger = logging.getLogger("wanxiang.workflow")
         self._validate_plan()
 
@@ -187,7 +196,11 @@ class WorkflowEngine:
                 }
             )
 
-        async def _execute_parallel_agent(name: str) -> tuple[str, Message, int]:
+        async def _execute_parallel_agent(
+            name: str, launch_delay_s: float
+        ) -> tuple[str, Message, int]:
+            if launch_delay_s > 0:
+                await asyncio.sleep(launch_delay_s)
             started_at = time.perf_counter()
             try:
                 output = await self.agents[name].execute(task)
@@ -203,7 +216,10 @@ class WorkflowEngine:
             return name, output, elapsed_ms
 
         branch_results = await asyncio.gather(
-            *[_execute_parallel_agent(name) for name in parallel_names],
+            *[
+                _execute_parallel_agent(name, i * self.parallel_stagger_s)
+                for i, name in enumerate(parallel_names)
+            ],
             return_exceptions=False,
         )
 

@@ -281,3 +281,86 @@ def test_parallel_events_emit_all_starts_before_parallel_completions() -> None:
         if event.get("type") == "agent_started" and event.get("agent") == "synthesizer"
     )
     assert parallel_completed_index < synth_started_index
+
+
+# ---- parallel stagger -----------------------------------------------------
+
+
+def test_parallel_stagger_defaults_to_8s():
+    """WorkflowEngine exposes the parallel_stagger_s config with a safe default."""
+    plan = _build_plan("parallel", ["r_a", "r_b", "synth"])
+    agents = {n: MockAgent(n, [(MessageStatus.SUCCESS, n)]) for n in ["r_a", "r_b", "synth"]}
+    engine = WorkflowEngine(agents=agents, plan=plan)
+    assert engine.parallel_stagger_s == 8.0
+
+
+def test_parallel_stagger_custom_value_respected():
+    plan = _build_plan("parallel", ["r_a", "r_b", "synth"])
+    agents = {n: MockAgent(n, [(MessageStatus.SUCCESS, n)]) for n in ["r_a", "r_b", "synth"]}
+    engine = WorkflowEngine(agents=agents, plan=plan, parallel_stagger_s=1.5)
+    assert engine.parallel_stagger_s == 1.5
+
+
+def test_parallel_stagger_negative_clamped_to_zero():
+    plan = _build_plan("parallel", ["r_a", "r_b", "synth"])
+    agents = {n: MockAgent(n, [(MessageStatus.SUCCESS, n)]) for n in ["r_a", "r_b", "synth"]}
+    engine = WorkflowEngine(agents=agents, plan=plan, parallel_stagger_s=-5.0)
+    assert engine.parallel_stagger_s == 0.0
+
+
+def test_parallel_stagger_delays_branch_launch():
+    """With stagger > 0, the second branch starts measurably later than the first."""
+    parallel_names = ["r_a", "r_b"]
+    agents: dict[str, MockAgent] = {
+        name: MockAgent(name, [(MessageStatus.SUCCESS, f"{name} output")])
+        for name in parallel_names + ["synth"]
+    }
+
+    launch_times: dict[str, float] = {}
+
+    class LaunchRecorder(MockAgent):
+        async def execute(self, message: Message) -> Message:
+            loop = asyncio.get_event_loop()
+            launch_times[self.name] = loop.time()
+            return await super().execute(message)
+
+    for name in parallel_names:
+        agents[name] = LaunchRecorder(name, [(MessageStatus.SUCCESS, f"{name} output")])
+
+    plan = _build_plan("parallel", parallel_names + ["synth"])
+    engine = WorkflowEngine(agents=agents, plan=plan, parallel_stagger_s=0.25)
+
+    task = Message(intent="Research", content="Task", sender="user")
+    asyncio.run(engine.run(task))
+
+    assert "r_a" in launch_times and "r_b" in launch_times
+    delta = launch_times["r_b"] - launch_times["r_a"]
+    # Allow some scheduling slack but require the stagger to actually delay
+    # the second branch by most of the configured amount.
+    assert delta >= 0.20, f"expected ≥0.20s stagger, got {delta:.3f}s"
+
+
+def test_parallel_stagger_zero_launches_all_simultaneously():
+    parallel_names = ["r_a", "r_b"]
+    agents: dict[str, MockAgent] = {}
+    launch_times: dict[str, float] = {}
+
+    class LaunchRecorder(MockAgent):
+        async def execute(self, message: Message) -> Message:
+            loop = asyncio.get_event_loop()
+            launch_times[self.name] = loop.time()
+            return await super().execute(message)
+
+    for name in parallel_names:
+        agents[name] = LaunchRecorder(name, [(MessageStatus.SUCCESS, f"{name} output")])
+    agents["synth"] = MockAgent("synth", [(MessageStatus.SUCCESS, "synth")])
+
+    plan = _build_plan("parallel", parallel_names + ["synth"])
+    engine = WorkflowEngine(agents=agents, plan=plan, parallel_stagger_s=0.0)
+
+    task = Message(intent="Research", content="Task", sender="user")
+    asyncio.run(engine.run(task))
+
+    delta = abs(launch_times["r_b"] - launch_times["r_a"])
+    # Without stagger, both branches should kick off essentially together.
+    assert delta < 0.10, f"expected near-simultaneous launch, got {delta:.3f}s"
