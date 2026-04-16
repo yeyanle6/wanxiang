@@ -1,0 +1,5 @@
+[
+  {"requirement": "convert chinese numerals to arabic", "suggested_name": "chinese_numeral_to_int", "success": true, "registered": true, "attempts": 1, "tool_name": "chinese_numeral_to_int"},
+  {"requirement": "compute nth fibonacci", "suggested_name": "fib", "success": true, "registered": true, "attempts": 2, "tool_name": "fib"},
+  {"requirement": "fetch live currency rate", "suggested_name": "fx_rate", "success": false, "registered": false, "attempts": 3, "error": "Exceeded max_retries=3 without producing a passing, registerable tool."}
+]
