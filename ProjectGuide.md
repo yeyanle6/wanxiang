@@ -213,6 +213,43 @@ Evaluation rules for THIS run (tool-aware):
 
 这是项目第一次用 mining 数据反过来驱动开发决策："合成工具持久化"从 Phase 4 的 nice-to-have 变成下一阶段的首位 backlog，理由不是主观判断而是客观观测。
 
+### Phase 6：安全进化架构（Immutable Core + Tool Trust Tier）
+**目标**：Phase 4 让系统能进化（SkillForge），Phase 5 让系统能观察自己（trace mining）。Phase 6 要让系统**能安全地进化**——先守住不崩，再放手进化。
+
+分两步递进：
+
+**6.1 不可变内核（Immutable Core）**
+
+核心问题：万象的自进化路径（SkillForge → trace mining → prompt self-tuning）意味着越来越多的行为由运行时数据和 LLM 决定。怎么保证进化不把系统自己搞坏？
+
+答案：**把三个设计支柱的代码实现声明为不可变**。5 个文件、具体到函数签名级别（见 D16）：
+- `message.py` —— 消息协议（支柱 1）
+- `agent.py` —— execute 主循环 + allowlist 门禁（支柱 2）
+- `pipeline.py` —— 三种 workflow 模式（支柱 2）
+- `tools.py` —— ToolRegistry.execute 安全管线（支柱 3）
+- `sandbox.py` —— 进程隔离 + 环境变量白名单（支柱 3）
+
+三层防护互为备份：`.githooks/pre-commit` 阻止提交 → `tests/test_immutable_core.py` 28 个 `inspect.signature` 锁定测试在 CI 捕获漂移 → `IMMUTABLE_CORE.md` 人类可读的变更审核文档。任何一层被绕过，另外两层还在。
+
+**6.2 工具信任等级（Tool Trust Tier）**
+
+核心问题：SkillForge 可以造任何工具，但"sandbox pytest 通过"不等于"值得信赖"。一个工具在 10 个不同场景下都正常工作，和一个只跑过 1 次 pytest 的工具，信赖度不应该一样。怎么量化？
+
+答案：四级信赖度 + 滑动窗口降级（见 D17）。`TierManager` 独立于 immutable core，是纯粹的 mutable periphery——可以被 mining 驱动调参，但不影响 ToolRegistry.execute 的核心安全管线。
+
+| Level | 含义 | 升级条件 |
+|---|---|---|
+| 0 | sandbox 通过 / 未使用 | 初始状态 |
+| 1 | 首次真实 SUCCESS | 1 次成功调用 |
+| 2 | 多场景验证 | ≥3 独立 run 成功 + 窗口 ≥90% |
+| 3 | 可信依赖 | 被非首位 agent 依赖调用 |
+
+降级：滑动窗口（默认最近 10 次）中失败 ≥3 次→降一级。降级优先于升级——失败信号比成功信号更重要。
+
+30 个测试覆盖升降级全路径、窗口遗忘机制、序列化、自定义阈值。
+
+**未接线**：TierManager 尚未接入 RunManager 的事件流。Phase 6.3 做接线，6.4 做 mining 驱动的 SkillForge 自动触发。等真实 run 数据积累够了再做。
+
 ---
 
 ## 3. 关键架构决策（Decision Log）
@@ -441,6 +478,49 @@ Evaluation rules for THIS run (tool-aware):
 
 **测试验证**：`test_default_failure_keywords_nonempty` + `test_extra_failure_keywords_are_honored` + `test_tool_classification_distinguishes_native_mcp_synthesized` 守住 D15 的三个可扩展性保证。
 
+### D16 · Immutable core 的边界划定
+**问题**：Phase 6 要加"安全进化"机制。怎么定义"什么不能被改"？
+
+**候选**：
+- (A) 把所有核心代码移到一个 `_primitives.py` 文件
+- (B) 不移动代码，用 manifest + hook + 签名测试标记哪些文件/函数是受保护的
+- (C) 只写文档，靠人工纪律
+
+**选择**：B。
+
+**理由**：A 是巨大的重构——改掉所有 import 路径，打断 git blame，只为了"放在一个文件"的组织美学。C 没有强制力——三个月后忘了就失效。B 是**最小侵入性的强制**：代码不动一行，只是在代码之上加了三层观测+拦截。
+
+具体边界划定原则：
+- **受保护的是公开接口签名**（函数参数列表和返回值），不是实现细节。`_render_team_capability_block` 的 prompt 文本可以调，但方法本身必须存在
+- **安全门禁必须存在**：`_execute_tool_with_allowlist` 的 `allowed` 参数、sandbox 的 `_scrubbed_env` 白名单、ToolRegistry.execute 的 validate→timeout→truncate→audit 管线。这些是安全边界，删掉任何一步都是安全降级
+- **可以加新文件、新方法**，但不能改受保护方法的签名。这意味着 Phase 6.2 的 TierManager 是完全合法的 mutable periphery——它不修改 tools.py 的任何签名
+
+**代价**：`from __future__ import annotations` 导致签名锁定测试里的类型标注是字符串形式（`'Message'` 而不是 `Message`）。Python 版本升级可能改变标注的字符串表示，需要同步更新测试。可接受——这种变化在 CI 里会立即被抓到。
+
+### D17 · 信任等级：滑动窗口 vs 单次失败降级
+**问题**：工具信赖等级应该在什么条件下降级？
+
+**候选**：
+- (A) 任何一次失败立刻降一级——最严格
+- (B) 滑动窗口：最近 N 次中失败 ≥ M 次才降——容忍偶发错误
+- (C) 只升不降——乐观策略
+
+**选择**：B。
+
+**理由**：A 太激进——一个 Level 2 工具在第 20 次调用时因输入边界情况失败一次就掉回 Level 1，会导致频繁的等级震荡。Level 频繁变化的信任系统没有人会信任。C 不诚实——一个实际在退化的工具永远保持高 level，信任标签就失去意义。B 是平衡：`deque(maxlen=10)` 自动遗忘老结果，窗口内的失败率才是当下信赖度的真实反映。
+
+具体参数（全部可配置，不硬编码）：
+- `window_size=10`：最近 10 次调用
+- `downgrade_threshold=3`：10 次里失败 ≥3 次降一级
+- `upgrade_2_min_runs=3`：升到 Level 2 需 ≥3 个独立 run
+- `upgrade_2_min_success_rate=0.9`：窗口成功率 ≥90%
+
+**降级优先于升级**是一条硬规则。`_check_downgrade` 在 `_check_upgrade` 之前执行。理由：在信任系统里，失去信任应该比获得信任更容易。这和"安全边界用代码硬守"是同一个哲学——对风险保守。
+
+**代价**：窗口大小和阈值是经验值，需要真实数据验证。参数全部暴露为构造函数参数，可以在不改代码的情况下调整。未来 trace mining 可以分析 `tier_history` 来建议最优参数。
+
+**测试验证**：`test_demotion_priority_over_promotion` 明确 assert 在同一次 `record_result` 调用中，即使同时满足升级和降级条件，降级优先。`test_sliding_window_forgets_old_results` 验证旧失败被推出窗口后不再触发降级。
+
 ---
 
 ## 4. 偏离原路线图之处
@@ -512,17 +592,21 @@ Evaluation rules for THIS run (tool-aware):
 10. `wanxiang/core/mcp_loader.py` —— YAML 解析 + MCPPool 生命周期
 11. `wanxiang/core/llm_client.py` —— 双后端 + mode 解析 + CLI MCP 隔离
 12. `wanxiang/core/trace_mining.py` —— 纯数据聚合层（9 个维度 / 关键词聚类 / 可插拔分类 / 时间窗口）
-13. `wanxiang/server/runner.py` —— 把引擎事件转成前端事件流
-14. `wanxiang/server/app.py` —— FastAPI endpoints + WebSocket + lifespan 绑定 MCPPool + SkillForge + mining endpoint
-15. `wanxiang/server/models.py` —— Pydantic response schema（含 `TraceMiningResponse` 等）
-16. `configs/agents/skill_synthesizer.yaml` —— synthesizer 的 JSON-only 输出契约
-17. `wanxiang-ui.jsx` —— 前端单文件，读完前 300 行的 helpers 就能跳着看
+13. `wanxiang/core/tier.py` —— 工具信任等级（四级 / 滑动窗口 / 升降级逻辑 / 审计轨迹）
+14. `wanxiang/server/runner.py` —— 把引擎事件转成前端事件流
+15. `wanxiang/server/app.py` —— FastAPI endpoints + WebSocket + lifespan 绑定 MCPPool + SkillForge + mining endpoint
+16. `wanxiang/server/models.py` —— Pydantic response schema（含 `TraceMiningResponse` 等）
+17. `configs/agents/skill_synthesizer.yaml` —— synthesizer 的 JSON-only 输出契约
+18. `IMMUTABLE_CORE.md` —— 受保护接口清单 + 变更流程
+19. `wanxiang-ui.jsx` —— 前端单文件，读完前 300 行的 helpers 就能跳着看
 
 测试代码（`tests/`）按核心程度：
 - `test_message.py` / `test_pipeline.py` / `test_factory.py` —— 核心行为
 - `test_tools.py` / `test_agent_tools.py` —— 工具系统完整边界 + reviewer capability block
 - `test_sandbox.py` / `test_skill_forge.py` —— Phase 4 自进化层（sandbox 隔离 + forge 闭环）
 - `test_trace_mining.py` / `test_trace_mining_endpoint.py` —— Phase 5 观察层（纯数据聚合 + HTTP endpoint）
+- `test_immutable_core.py` —— Phase 6.1 签名锁定（28 tests，守住 5 个核心文件的公开接口）
+- `test_tier.py` —— Phase 6.2 信任等级（30 tests，升降级全路径 + 窗口 + 序列化 + 自定义阈值）
 - `test_mcp_client.py` / `test_mcp_bridge.py` / `test_mcp_loader.py` —— MCP 协议、桥接、生命周期
 - `test_llm_client_modes.py` / `test_mcp_status.py` —— 基础设施
 - `test_server_events.py` / `test_runner_tool_events.py` —— 事件流一致性

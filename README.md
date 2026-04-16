@@ -4,7 +4,7 @@
 >
 > **AI 原生的多 Agent 编排引擎** —— Director 动态规划团队执行任意任务，支持三种编排模式、双 LLM 通道与实时可观测 UI。
 
-[![tests](https://img.shields.io/badge/tests-175%20passing-brightgreen)]()
+[![tests](https://img.shields.io/badge/tests-233%20passing-brightgreen)]()
 [![python](https://img.shields.io/badge/python-3.11%2B-blue)]()
 [![license](https://img.shields.io/badge/license-MIT-lightgrey)]()
 
@@ -78,6 +78,8 @@ flowchart TB
 - **Runtime tool synthesis**: When Director encounters a task needing a capability no existing tool provides, it can request a new tool via `needs_synthesis`. The `SkillForge` spins up a `SynthesizerAgent` → pytest-gated `SandboxExecutor` → on-pass `ToolRegistry.register` loop (with feedback-driven retry). The new tool is instantly available to downstream agents in the same run. Feature-flagged via `WANXIANG_ENABLE_SKILL_FORGE=1`.
 - **Tool safety**: JSON Schema Draft 7 argument validation, UTF-8-safe output truncation (50 KB cap), ring-buffered call audit log (`GET /api/tools/audit`)
 - **Offline trace mining**: `wanxiang.core.trace_mining.mine_traces()` aggregates `runs.jsonl` + tool audit log + synthesis log into a structured `TraceMiningReport` (final-status distribution, workflow mix, keyword-clustered failure patterns, per-tool usage grouped into builtin/native/mcp/synthesized, synthesis success rate, reviewer-convergence buckets, slowest agents, producer naming distribution). Exposed via `GET /api/trace/mining` with optional `?after=` / `?before=` ISO-8601 window filters. Pure static analysis — no LLM calls.
+- **Immutable core protection**: Five files that define Wanxiang's safety boundaries (Message protocol, BaseAgent.execute + allowlist, WorkflowEngine three modes, ToolRegistry.execute safety pipeline, SandboxExecutor env isolation) are guarded by a pre-commit hook (`.githooks/pre-commit`) and 28 `inspect.signature` lock tests. Changes require `ALLOW_CORE_CHANGE=1` and manifest update. See `IMMUTABLE_CORE.md`.
+- **Tool trust tier**: Four-level confidence grading (0=sandbox-passed, 1=first-real-SUCCESS, 2=multi-run-verified, 3=trusted-dependency) with sliding-window demotion (default: ≥3 failures in last 10 calls drops one level). Tiers go down as easily as they go up — failure signals take priority over success. All thresholds configurable.
 
 ### Quick Start
 
@@ -142,13 +144,15 @@ Coverage spans Message protocol, three workflow engines, AgentFactory policies, 
 ```
 .
 ├── wanxiang/              # Python package
-│   ├── core/              # Message, BaseAgent, Factory, WorkflowEngine, Tools, LLMClient, SkillForge, trace_mining
+│   ├── core/              # Message, BaseAgent, Factory, WorkflowEngine, Tools, LLMClient, SkillForge, trace_mining, tier
 │   ├── server/            # FastAPI app, RunManager, events, MCP probe
 │   ├── cli.py             # One-shot CLI entry point
 │   └── __main__.py
 ├── configs/agents/        # Example agent YAML configs
 ├── data/                  # Runtime JSONL history (gitignored)
-├── tests/                 # pytest suite (175 tests) + fixtures/
+├── tests/                 # pytest suite (233 tests) + fixtures/
+├── .githooks/             # Pre-commit hook for immutable core protection
+├── IMMUTABLE_CORE.md      # Protected interfaces manifest
 ├── wanxiang-ui.jsx        # Single-file React UI served by the FastAPI app
 └── README.md
 ```
@@ -160,11 +164,15 @@ Coverage spans Message protocol, three workflow engines, AgentFactory policies, 
 - [x] Phase 3D: tool hardening — jsonschema-backed validation, UTF-8-safe output cap, ring-buffered audit log with query API (111 tests)
 - [x] Phase 4: runtime tool synthesis — process-isolated `SandboxExecutor`, `SkillForge` generate→test→feedback→retry loop, Director `needs_synthesis` protocol, policy floor for tool-using agents (147 tests). End-to-end verified: Director declares a gap → LLM emits handler+tests → sandbox runs pytest → handler registered → agent calls it via tool_use and returns correct data.
 - [x] Phase 5: offline trace mining — pure data layer (`wanxiang.core.trace_mining`) consumes `runs.jsonl` + audit log + synthesis log; `GET /api/trace/mining` endpoint with `?after=` / `?before=` filters; Pydantic response schema; hand-authored fixture suite + 28 tests (175 total). Verified on real production data: surfaces reviewer-convergence gaps, CLI-auth infra errors, and "unknown" tool-group buckets (which exposed the next dependency — synthesized tool persistence).
+- [x] Phase 6.1: immutable core — `IMMUTABLE_CORE.md` manifest documenting 5 protected files + their public interfaces; `.githooks/pre-commit` blocks unauthorized changes; 28 `inspect.signature` lock tests ensure CI catches accidental drift. Establishes the "safe evolution" architecture: mutable periphery (tools, personas, policies) can evolve freely, immutable core (protocol, execute loops, safety gates) requires human review.
+- [x] Phase 6.2: tool trust tier — `wanxiang.core.tier.TierManager` with four-level confidence grading (0–3) and sliding-window demotion. 30 tests covering promotion, demotion priority, window forgetting, dependency-use signal, serialization, and custom thresholds. Independent of immutable core — pure mutable periphery (233 total tests).
 - [x] Packaging: `pyproject.toml` with `pip install -e ".[dev]"`
 - [x] UI polish: WebSocket event loss fix, bilingual region naming (dark mode pending)
 - [x] `ProjectGuide.md` — architecture evolution log
-- [ ] Synthesized tool persistence: write handler + tests to a reviewed `skills/` dir, auto-load on startup. Closes the "group=unknown" and "synthesis_stats=0 after restart" gaps that trace mining exposed (next)
-- [ ] UI panels for `/api/mcp/wanxiang-pool`, `/api/skill-forge/status`, and `/api/trace/mining`
+- [ ] Phase 6.3: wire TierManager into RunManager (tool_completed → record_result), SkillForge (register → initialize_tool), mining report (tier_changes column), `/api/tier` endpoint (next)
+- [ ] Phase 6.4: mining-driven SkillForge auto-trigger — failure pattern "capability gap" → automatic synthesis (needs 6.3 + real data)
+- [ ] Synthesized tool persistence: write handler + tests to `skills/` dir with tier metadata + human review gate
+- [ ] UI panels for `/api/mcp/wanxiang-pool`, `/api/skill-forge/status`, `/api/trace/mining`, `/api/tier`
 - [ ] MCP SSE transport (Notion / Gmail / Calendar via remote MCP servers)
 - [ ] Prompt self-tuning agent: LLM interpreter on top of trace mining — deferred until `runs.jsonl` accumulates ≥50 real (non-infra-error) runs for statistical signal
 
@@ -191,6 +199,8 @@ Coverage spans Message protocol, three workflow engines, AgentFactory policies, 
 - **运行时工具合成**：Director 遇到现有工具无法满足的能力时，可通过 `needs_synthesis` 请求合成新工具。`SkillForge` 驱动 `SynthesizerAgent` → 经过 pytest 验证的 `SandboxExecutor` → 通过后 `ToolRegistry.register` 的闭环（失败时带反馈重试）。合成的工具当轮 run 内即可被下游 Agent 调用。通过 `WANXIANG_ENABLE_SKILL_FORGE=1` 开启
 - **工具安全**：JSON Schema Draft 7 参数校验、UTF-8 安全输出截断（50KB 上限）、ring-buffered 调用审计日志（`GET /api/tools/audit`）
 - **离线 trace mining**：`wanxiang.core.trace_mining.mine_traces()` 聚合 `runs.jsonl` + 工具审计日志 + 合成日志，产出结构化的 `TraceMiningReport`（final_status 分布、workflow 分布、关键词聚类的失败模式、按 builtin/native/mcp/synthesized 分组的工具使用、合成成功率、reviewer 收敛分桶、最慢 Agent、producer 命名分布）。通过 `GET /api/trace/mining` 暴露，支持 `?after=` / `?before=` ISO-8601 窗口过滤。纯静态分析，零 LLM 调用。
+- **不可变内核保护**：5 个定义万象安全边界的文件（Message 协议、BaseAgent.execute + allowlist、WorkflowEngine 三模式、ToolRegistry.execute 安全管线、SandboxExecutor 环境隔离）由 pre-commit hook（`.githooks/pre-commit`）和 28 个 `inspect.signature` 签名锁定测试守护。修改需 `ALLOW_CORE_CHANGE=1` + 更新 manifest。详见 `IMMUTABLE_CORE.md`。
+- **工具信任等级**：四级信赖度评级（0=sandbox 通过、1=首次真实 SUCCESS、2=多场景验证、3=可信依赖），配合滑动窗口降级（默认：最近 10 次中失败 ≥3 次降一级）。降级优先于升级——失败信号比成功信号更重要。所有阈值可配置。
 
 ### 快速开始
 
@@ -255,13 +265,15 @@ pytest -q
 ```
 .
 ├── wanxiang/              # Python 包
-│   ├── core/              # Message、BaseAgent、Factory、WorkflowEngine、Tools、LLMClient、SkillForge、trace_mining
+│   ├── core/              # Message、BaseAgent、Factory、WorkflowEngine、Tools、LLMClient、SkillForge、trace_mining、tier
 │   ├── server/            # FastAPI app、RunManager、事件、MCP 探测
 │   ├── cli.py             # 一次性 CLI 入口
 │   └── __main__.py
 ├── configs/agents/        # 示例 agent YAML 配置
 ├── data/                  # 运行时 JSONL 历史（已 gitignore）
-├── tests/                 # pytest 测试（175 个）+ fixtures/
+├── tests/                 # pytest 测试（233 个）+ fixtures/
+├── .githooks/             # Pre-commit hook，不可变内核保护
+├── IMMUTABLE_CORE.md      # 受保护接口清单
 ├── wanxiang-ui.jsx        # FastAPI 提供的单文件 React UI
 └── README.md
 ```
@@ -273,13 +285,17 @@ pytest -q
 - [x] Phase 3D：工具加固 —— jsonschema 校验、UTF-8 安全输出截断、环形调用审计 + 查询 API（111 个测试）
 - [x] Phase 4：运行时工具合成 —— 进程隔离的 `SandboxExecutor`、`SkillForge` 生成→测试→反馈→重试闭环、Director `needs_synthesis` 协议、工具型 agent 的 policy 下限（147 个测试）。端到端验证通过：Director 识别工具缺口 → LLM 输出 handler+测试 → sandbox 跑 pytest → 通过则注册 → agent 在 workflow 里调用并返回正确结果。
 - [x] Phase 5：离线 trace mining —— 纯数据层（`wanxiang.core.trace_mining`）消费 `runs.jsonl` + 审计日志 + synthesis_log；`GET /api/trace/mining` endpoint 带 `?after=` / `?before=` 过滤；Pydantic response schema；手写 fixture + 28 个测试（累计 175 个）。真实生产数据验证通过：定位到 reviewer 收敛率缺口、CLI 认证 infra 错误、以及 "group=unknown" 工具分类问题（后者直接暴露了下一步的依赖——合成工具持久化）。
+- [x] Phase 6.1：不可变内核 —— `IMMUTABLE_CORE.md` manifest 记录 5 个受保护文件及其公开接口；`.githooks/pre-commit` 阻止未授权修改；28 个 `inspect.signature` 锁定测试确保 CI 捕获意外漂移。确立"安全进化"架构：可变外围（工具、persona、policy）自由进化，不可变内核（协议、执行循环、安全门）需人工审核。
+- [x] Phase 6.2：工具信任等级 —— `wanxiang.core.tier.TierManager` 四级信赖度（0–3）+ 滑动窗口降级。30 个测试覆盖升级、降级优先、窗口遗忘、依赖使用信号、序列化、自定义阈值。独立于不可变内核——纯可变外围（累计 233 个测试）。
 - [x] 打包：`pyproject.toml` + `pip install -e ".[dev]"`
 - [x] UI 润色：WebSocket 事件丢失修复、区域命名中英化（深色模式待做）
 - [x] `ProjectGuide.md` —— 架构演进记录
-- [ ] 合成工具持久化：把 handler + 测试写入经人工审核的 `skills/` 目录，启动时自动加载。解决 trace mining 暴露的 "group=unknown" 和 "重启后 synthesis_stats 归零" 问题（下一步）
-- [ ] UI 面板接入 `/api/mcp/wanxiang-pool`、`/api/skill-forge/status`、`/api/trace/mining`
+- [ ] Phase 6.3：接线 —— TierManager 接入 RunManager（tool_completed → record_result）、SkillForge（register → initialize_tool）、mining 报告（tier_changes 列）、`/api/tier` endpoint（下一步）
+- [ ] Phase 6.4：mining 驱动的 SkillForge 自动触发 —— 失败模式"能力缺口"→ 自动合成（需要 6.3 + 真实数据）
+- [ ] 合成工具持久化：把 handler + 测试 + tier 元数据写入经人工审核的 `skills/` 目录
+- [ ] UI 面板接入 `/api/mcp/wanxiang-pool`、`/api/skill-forge/status`、`/api/trace/mining`、`/api/tier`
 - [ ] MCP SSE transport（接入 Notion / Gmail / Calendar 等云端 MCP server）
-- [ ] Prompt self-tuning agent：基于 trace mining 的 LLM 解读层 —— 延后至 `runs.jsonl` 积累 ≥50 个真实 run（排除 infra error）后再做，以保证统计显著性
+- [ ] Prompt self-tuning agent：基于 trace mining 的 LLM 解读层 —— 延后至 `runs.jsonl` 积累 ≥50 个真实 run（排除 infra error）后再做
 
 ---
 
