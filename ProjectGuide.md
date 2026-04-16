@@ -148,6 +148,47 @@ Evaluation rules for THIS run (tool-aware):
 
 真实端到端验证：跑 `@modelcontextprotocol/server-filesystem` + 任务"读 demo.txt 并总结"。Director 自动分配 `read_text_file` 给 analyst，工具 9ms 返回真实内容，reviewer 一轮 SUCCESS，总耗时 85s。
 
+### Phase 3D：工具层加固
+**目标**：Phase 4 要让 LLM 动态生成工具。如果工具层本身校验松、输出不限、无审计，那从 Synthesizer 出来的 bug 代码会直接污染引擎。
+
+关键文件：`core/tools.py`（新增 / 修改）、`server/app.py`（`/api/tools/audit`）。
+
+三步渐进加固：
+- **Step 1 · JSON Schema 完整校验**：扔掉手写的 `_validate_arguments` + `_matches_type`（~40 行），换成 `jsonschema` 库。之前 6 类约束（enum / minimum / pattern / nested required / additionalProperties / anyOf）全部被静默放行；现在都强制生效，且错误消息带字段路径（"at 'user.age'"）
+- **Step 2 · 输出守卫**：`ToolSpec.max_output_bytes`（默认 50KB），`_safe_truncate_utf8` 在 UTF-8 字节边界切断（`errors='ignore'` 丢尾部残字节，不抛 `UnicodeDecodeError`），超限后在末尾追加 `[Output truncated: <orig> bytes → <limit> bytes]` 告知 LLM。保护 context window 不被 runaway handler 撑爆
+- **Step 3 · 环形审计日志**：`collections.deque(maxlen=1000)` 记录 `ToolCallRecord`（timestamp / success / elapsed_ms / input_bytes / output_bytes / truncated / error），`/api/tools/audit?limit=&tool=` endpoint 按需查询。为 trace mining 提供结构化工具层数据
+
+### Phase 4：运行时工具合成（Level 1 能力组合式自进化）
+**目标**：让系统在运行时为自己造工具。不是"改 Agent 的 prompt"或"调参数"，而是真的**注册新的 Python callable** 到 Registry。
+
+关键文件：
+- `core/sandbox.py` —— 进程级隔离的 pytest 执行器（12 tests）
+- `core/skill_forge.py` —— Synthesizer + Sandbox + Registry 的编排闭环（14 tests）
+- `configs/agents/skill_synthesizer.yaml` —— JSON-only 输出契约的 agent 定义
+- `core/factory.py` —— `needs_synthesis` 协议 + synthesis 阶段 + max_tool_rounds 下限（7 tests）
+- `server/app.py` —— FastAPI lifespan 挂载 SkillForge（feature-flagged）
+
+分 4 个递进 commit：
+
+**4.1 SandboxExecutor**：tempfile.mkdtemp → 写入 handler.py + test_handler.py → asyncio spawn `python -m pytest -q` → `asyncio.wait_for` 强制超时 → `_safe_truncate_utf8` 截断 stdout/stderr → shutil.rmtree in finally。关键安全措施：env 只保留 PATH/PYTHONPATH/LANG/LC_*（ANTHROPIC_API_KEY 等 secrets 绝不泄露给子进程）、`stdin=DEVNULL`（防 `input()` 挂起）、cwd 锁 tempdir。12 个单测覆盖 passing / failing / syntax error / no tests collected / timeout / env scrub / 大输出截断 / tempdir 清理。
+
+**4.2 SkillForge**：`ForgeResult` + `ForgeAttempt` 数据结构记录每轮尝试（为 trace mining 预留）。`parse_synthesizer_response` 三级 fallback（raw / markdown fence / 贪婪 `{...}`）。`forge()` 循环：run synthesizer → parse → name collision check → sandbox → success 则 `exec()` handler 绑定到 `ToolSpec(group="synthesized")` 注册 / failure 则构建结构化反馈给下一轮。14 个单测包括"首次失败 → pytest stderr 反馈 → 第二轮修正 → 通过"的核心闭环。
+
+**4.3 Director 感知 + Factory 触发**：planner prompt 加"OPTIONAL Runtime tool synthesis"段落（告知只用于 pure-Python deterministic capabilities，不要用于网络/文件系统）。`TeamPlan.needs_synthesis: list[SynthesisRequest]`。`_run_synthesis_stage` 串联 forge 调用，成功后把占位的 `suggested_name` 替换为真实注册的 `tool_name` 到 agent 的 `allowed_tools`。
+
+**4.4 Server 接线 + max_tool_rounds 下限**：`WANXIANG_ENABLE_SKILL_FORGE=1` 环境变量开启；`/api/skill-forge/status` 端点。Policy 层新增 `MIN_ROUNDS_FOR_TOOL_USERS = 15`，Director 默认给 5 且对批量任务偏小——此 floor 保证有工具的 agent 至少能跑 15 轮 tool loop（D14）。
+
+真实端到端验证（CLI 模式，批量任务）：
+> "请把下列 10 个中文数字批量转换成阿拉伯数字，然后求和：..."
+
+- Director 识别缺口 → `needs_synthesis: [{"requirement": "convert chinese numerals to arabic", "suggested_name": "chinese_numeral_to_int"}]`
+- SkillForge 调 synthesizer → LLM 一次给出完整 handler + pytest（含"零"、"万"等 edge case）
+- Sandbox 跑 pytest → 通过 → 注册
+- converter agent 调用 10 次，全部返回正确结果（包括 `一万零二十 → 10020`、`三十万五千 → 305000`、`七千零八 → 7008` 这些含零/大位数的 tricky case）
+- 总和 341,873 正确
+
+**没有人写一行中文数字转换的代码**。这是 Level 1 能力组合式自进化的首次实现。
+
 ---
 
 ## 3. 关键架构决策（Decision Log）
@@ -299,6 +340,57 @@ Evaluation rules for THIS run (tool-aware):
 
 **代价**：reviewer prompt 正在变成"各种情境下的评审手册"。长期看需要抽成独立的 reviewer policy module。
 
+### D12 · Sandbox 选择：进程级 vs Docker
+**问题**：Phase 4 的 Synthesizer 会让 LLM 生成并执行 Python 代码。用什么级别的隔离？
+
+**候选**：
+- (A) 直接 `exec()`，不隔离
+- (B) 进程级：tempfile.TemporaryDirectory + subprocess + env scrub + timeout
+- (C) Docker 容器
+- (D) nsjail / seccomp / gVisor
+
+**选择**：B。
+
+**理由**：A 不可接受——LLM 生成的代码有权访问 `ANTHROPIC_API_KEY`、文件系统、网络。D 太重，对 Phase 4 MVP 是过度工程。C 的启动开销（秒级）在 forge 重试循环里累积很可观（每次 retry 都多等 1-2 秒），且需要宿主机装 Docker 守护进程，部署成本上升。B 刚够——handler_code 被约束为 pure-Python + stdlib + no I/O（在 synthesizer YAML 的 hard constraints 里写死），子进程 env 只保留 PATH/PYTHONPATH/LANG/LC_*（实测验证 `ANTHROPIC_API_KEY` 在子进程里不可见），tempdir + cwd 隔离文件系统。
+
+**代价**：如果未来放宽 handler 约束（允许导入第三方包 / 文件系统写入），B 的防线会不够。那时候该重新评估 C 或 D。现在不做是对的——**YAGNI 原则**。
+
+### D13 · SkillForge 的失败反馈循环
+**问题**：Synthesizer 第一次生成错代码是常态。怎么让它修正？
+
+**候选**：
+- (A) 固定重试 N 次，每次让它重新生成
+- (B) 每次把 pytest stderr/stdout + 结构化 feedback 喂给 synthesizer，让它基于错误信息修正
+
+**选择**：B。
+
+**理由**：A 就是随机撞运气，第二次生成和第一次没有因果关系。B 让每次 retry 都是**条件独立 retry → 条件相关 debug**。`SkillForge._build_feedback` 按 SandboxResult 的形状构造不同措辞：
+- `timed_out=True` → "Your test timed out. Avoid infinite loops..."
+- 有 `stderr` → 贴上 pytest traceback
+- 有 `stdout` → 贴上 pytest 输出
+- 名字冲突 → "The tool name '...' is already taken. Choose a different name"
+- 解析失败 → "Return a single JSON object; do not include any prose."
+
+**测试验证**：`test_forge_recovers_from_failing_test_on_retry` 明确 assert 第二轮的 prompt 里包含 "Feedback on your previous attempt" 且携带 pytest 的具体 test 名——这是证明闭环有因果关系、不是随机撞运气的决定性证据。
+
+**代价**：反馈作为 user turn 发给 synthesizer 增加 token 开销。实测 3 轮以内收敛，成本可接受。
+
+### D14 · max_tool_rounds 的硬 floor
+**问题**：Phase 4 端到端首次真实跑批量任务（10 个数字转换）时，converter 在 3 轮 tool call 后就 `Exceeded max_tool_rounds=3`，整个 pipeline ERROR。每次 tool call 都成功（83ms / 1ms / 2ms），真正的瓶颈是 round 上限。
+
+**候选**：
+- (A) 接受这是 Director 的职责，改 planner prompt 让它给批量任务设更高的 max_tool_rounds
+- (B) Policy 层兜底：有工具的 agent 自动至少 15 轮
+- (C) 动态估算：根据任务文本里"批量 / 10 个 / 每个"之类的关键字自动调整
+
+**选择**：B。
+
+**理由**：A 不可靠——Director 会复制 planner prompt 里的 `"max_tool_rounds": 5` 示例，对批量任务判断不准。这和 D4（policy 兜底 vs 纯 Director 规划）是同一个模式：**LLM 的结构化约束能力有上限，重复出现的失败模式交给代码层兜底更可靠**。C 太花哨，且启发式规则本身容易出错。B 的代价只是 tool-less agent 的少量重复检查（no-op），换来批量 workload 的可用性。
+
+**测试验证**：`test_tool_users_get_max_tool_rounds_lifted_to_floor` 等 3 个测试守住该行为：有工具 + Director 给 3 → 抬到 15；已经 50 的保留 50；无工具不动。
+
+**代价**：15 是个经验魔数。未来可能需要按 tool 类型分级（web_search 重、echo 轻）。不急着做。
+
 ---
 
 ## 4. 偏离原路线图之处
@@ -320,10 +412,12 @@ Evaluation rules for THIS run (tool-aware):
 ## 5. 待改进 / 未解问题
 
 ### 5.1 未完成
-- **MCP SSE transport**：目前只支持 stdio。用户 Claude CLI 连接的 Notion / Gmail / Calendar 等云端 MCP server 走 SSE 协议，接入需要在 `mcp_client.py` 加一个 `SSETransport` 实现。
-- **UI MCP pool panel**：`/api/mcp/wanxiang-pool` endpoint 已有，但前端还没展示 Wanxiang 自己 spawn 了哪些 server / 注册了哪些工具。
-- **LICENSE 文件**：README 里声明了 MIT，但仓库里还没实际的 LICENSE 文件。
-- **深色模式**：前端只有亮色。
+- **Trace mining agent**（下一步）：离线 agent 分析 `runs.jsonl`，发现重复出现的失败模式（reviewer 频繁苛求、某类任务反复重试、某个 synthesized tool 被多次重新合成）并输出 policy 调优建议。工具层数据已经准备好（Phase 3D Step 3 的审计日志 + Phase 4 的 synthesis_log），缺的是消费者
+- **Synthesized tool 持久化**：目前合成的工具只在当前 run 内生效。需要把 `handler_code` + `test_code` 写入 `skills/` 目录 + 人工审核流程（审核后持久化，下次启动自动加载）
+- **MCP SSE transport**：目前只支持 stdio。用户 Claude CLI 连接的 Notion / Gmail / Calendar 等云端 MCP server 走 SSE 协议，接入需要在 `mcp_client.py` 加一个 `SSETransport` 实现
+- **UI MCP pool panel + SkillForge 可视化**：`/api/mcp/wanxiang-pool` 和 `/api/skill-forge/status` endpoint 已有，但前端还没展示 Wanxiang 自己 spawn 了哪些 server、注册了哪些工具、最近合成了什么
+- **LICENSE 文件**：README 里声明了 MIT，但仓库里还没实际的 LICENSE 文件
+- **深色模式**：前端只有亮色
 
 ### 5.2 已知但未修
 - **Policy 层膨胀**：`factory.py` 的 policy 逻辑已 200+ 行，未来需要拆成独立的 `policies.py`，支持 pluggable 规则。
@@ -359,18 +453,22 @@ Evaluation rules for THIS run (tool-aware):
 2. `wanxiang/core/agent.py` —— BaseAgent 的 execute 主循环 + tool loop + team_context
 3. `wanxiang/core/factory.py` —— Director 怎么规划 + policy 兜底 + tool 展示分组
 4. `wanxiang/core/pipeline.py` —— 三种 workflow 怎么编排
-5. `wanxiang/core/tools.py` + `builtin_tools.py` —— 工具注册和执行机制（group / allowed_agents）
-6. `wanxiang/core/mcp_client.py` —— JSON-RPC 2.0 + stdio transport + reader-task pattern
-7. `wanxiang/core/mcp_bridge.py` —— MCP tools → ToolSpec（schema 透传）
-8. `wanxiang/core/mcp_loader.py` —— YAML 解析 + MCPPool 生命周期
-9. `wanxiang/core/llm_client.py` —— 双后端 + mode 解析 + CLI MCP 隔离
-10. `wanxiang/server/runner.py` —— 把引擎事件转成前端事件流
-11. `wanxiang/server/app.py` —— FastAPI endpoints + WebSocket + lifespan 绑定 MCPPool
-12. `wanxiang-ui.jsx` —— 前端单文件，读完前 300 行的 helpers 就能跳着看
+5. `wanxiang/core/tools.py` + `builtin_tools.py` —— 工具注册和执行机制（group / allowed_agents / max_output_bytes / 审计日志）
+6. `wanxiang/core/sandbox.py` —— 进程级隔离的 pytest 执行器（env scrub / timeout / tempdir / UTF-8 截断）
+7. `wanxiang/core/skill_forge.py` —— Synthesizer + Sandbox + Registry 的生成→测试→反馈→注册闭环
+8. `wanxiang/core/mcp_client.py` —— JSON-RPC 2.0 + stdio transport + reader-task pattern
+9. `wanxiang/core/mcp_bridge.py` —— MCP tools → ToolSpec（schema 透传）
+10. `wanxiang/core/mcp_loader.py` —— YAML 解析 + MCPPool 生命周期
+11. `wanxiang/core/llm_client.py` —— 双后端 + mode 解析 + CLI MCP 隔离
+12. `wanxiang/server/runner.py` —— 把引擎事件转成前端事件流
+13. `wanxiang/server/app.py` —— FastAPI endpoints + WebSocket + lifespan 绑定 MCPPool + SkillForge
+14. `configs/agents/skill_synthesizer.yaml` —— synthesizer 的 JSON-only 输出契约
+15. `wanxiang-ui.jsx` —— 前端单文件，读完前 300 行的 helpers 就能跳着看
 
 测试代码（`tests/`）按核心程度：
 - `test_message.py` / `test_pipeline.py` / `test_factory.py` —— 核心行为
 - `test_tools.py` / `test_agent_tools.py` —— 工具系统完整边界 + reviewer capability block
+- `test_sandbox.py` / `test_skill_forge.py` —— Phase 4 自进化层（sandbox 隔离 + forge 闭环）
 - `test_mcp_client.py` / `test_mcp_bridge.py` / `test_mcp_loader.py` —— MCP 协议、桥接、生命周期
 - `test_llm_client_modes.py` / `test_mcp_status.py` —— 基础设施
 - `test_server_events.py` / `test_runner_tool_events.py` —— 事件流一致性

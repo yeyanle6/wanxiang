@@ -4,7 +4,7 @@
 >
 > **AI 原生的多 Agent 编排引擎** —— Director 动态规划团队执行任意任务，支持三种编排模式、双 LLM 通道与实时可观测 UI。
 
-[![tests](https://img.shields.io/badge/tests-53%20passing-brightgreen)]()
+[![tests](https://img.shields.io/badge/tests-147%20passing-brightgreen)]()
 [![python](https://img.shields.io/badge/python-3.11%2B-blue)]()
 [![license](https://img.shields.io/badge/license-MIT-lightgrey)]()
 
@@ -75,6 +75,8 @@ flowchart TB
 - **Real-time UI**: WebSocket event stream, DAG visualization with live state, tool-call sub-step cards, duration analysis, draft diff, reviewer feedback aggregation, trace replay, run history
 - **Graceful degradation**: In CLI mode, native tools are auto-stripped with a warning; agents fall back to plain LLM calls rather than crashing
 - **MCP status probe**: Built-in endpoint checks `claude auth status` + `claude mcp list` and surfaces the result to the UI
+- **Runtime tool synthesis**: When Director encounters a task needing a capability no existing tool provides, it can request a new tool via `needs_synthesis`. The `SkillForge` spins up a `SynthesizerAgent` → pytest-gated `SandboxExecutor` → on-pass `ToolRegistry.register` loop (with feedback-driven retry). The new tool is instantly available to downstream agents in the same run. Feature-flagged via `WANXIANG_ENABLE_SKILL_FORGE=1`.
+- **Tool safety**: JSON Schema Draft 7 argument validation, UTF-8-safe output truncation (50 KB cap), ring-buffered call audit log (`GET /api/tools/audit`)
 
 ### Quick Start
 
@@ -154,9 +156,12 @@ Coverage spans Message protocol, three workflow engines, AgentFactory policies, 
 
 - [x] Phase 1–3: engine, UI, event stream, MCP status probe, 53 tests
 - [x] Phase 3C: external MCP server integration — stdio client (JSON-RPC 2.0), YAML-configured pool, ToolRegistry bridge, Director-aware tool assignment, allowed_agents ACL, and CLI MCP isolation (91 tests). Filesystem verified end-to-end; Notion/SSE pending.
+- [x] Phase 3D: tool hardening — jsonschema-backed validation, UTF-8-safe output cap, ring-buffered audit log with query API (111 tests)
+- [x] Phase 4: runtime tool synthesis — process-isolated `SandboxExecutor`, `SkillForge` generate→test→feedback→retry loop, Director `needs_synthesis` protocol, policy floor for tool-using agents (147 tests). End-to-end verified: Director declares a gap → LLM emits handler+tests → sandbox runs pytest → handler registered → agent calls it via tool_use and returns correct data.
 - [x] Packaging: `pyproject.toml` with `pip install -e ".[dev]"`
 - [x] UI polish: WebSocket event loss fix, bilingual region naming (dark mode pending)
 - [x] `ProjectGuide.md` — architecture evolution log
+- [ ] Trace mining: offline agent analyzes `runs.jsonl` to surface failure patterns and policy-tuning suggestions (next)
 
 ---
 
@@ -178,6 +183,8 @@ Coverage spans Message protocol, three workflow engines, AgentFactory policies, 
 - **实时 UI**：WebSocket 事件流、DAG 实时高亮、工具调用子步骤卡片、耗时分析、初稿终稿 Diff、Reviewer Feedback 聚合、trace 回放、历史记录
 - **优雅降级**：CLI 模式下 native tools 自动剥离（含警告日志），Agent 回退到 registry tools 或纯 LLM，不会崩溃
 - **MCP 状态探测**：内置端点检查 `claude auth status` + `claude mcp list`，结果呈现在 UI
+- **运行时工具合成**：Director 遇到现有工具无法满足的能力时，可通过 `needs_synthesis` 请求合成新工具。`SkillForge` 驱动 `SynthesizerAgent` → 经过 pytest 验证的 `SandboxExecutor` → 通过后 `ToolRegistry.register` 的闭环（失败时带反馈重试）。合成的工具当轮 run 内即可被下游 Agent 调用。通过 `WANXIANG_ENABLE_SKILL_FORGE=1` 开启
+- **工具安全**：JSON Schema Draft 7 参数校验、UTF-8 安全输出截断（50KB 上限）、ring-buffered 调用审计日志（`GET /api/tools/audit`）
 
 ### 快速开始
 
@@ -257,9 +264,12 @@ pytest -q
 
 - [x] Phase 1–3：引擎、UI、事件流、MCP 状态探测，53 个测试
 - [x] Phase 3C：接入真实外部 MCP server —— stdio 客户端（JSON-RPC 2.0）、YAML 配置的 pool、ToolRegistry 桥接、Director 工具感知、allowed_agents ACL、CLI MCP 隔离（91 个测试）。filesystem 端到端验证通过；Notion / SSE 待做。
+- [x] Phase 3D：工具加固 —— jsonschema 校验、UTF-8 安全输出截断、环形调用审计 + 查询 API（111 个测试）
+- [x] Phase 4：运行时工具合成 —— 进程隔离的 `SandboxExecutor`、`SkillForge` 生成→测试→反馈→重试闭环、Director `needs_synthesis` 协议、工具型 agent 的 policy 下限（147 个测试）。端到端验证通过：Director 识别工具缺口 → LLM 输出 handler+测试 → sandbox 跑 pytest → 通过则注册 → agent 在 workflow 里调用并返回正确结果。
 - [x] 打包：`pyproject.toml` + `pip install -e ".[dev]"`
 - [x] UI 润色：WebSocket 事件丢失修复、区域命名中英化（深色模式待做）
 - [x] `ProjectGuide.md` —— 架构演进记录
+- [ ] Trace mining：离线 agent 分析 `runs.jsonl`，发现失败模式并提 policy 调优建议（下一步）
 
 ---
 
