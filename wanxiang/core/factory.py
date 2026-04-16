@@ -5,12 +5,15 @@ import logging
 import os
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .agent import AgentConfig, BaseAgent
 from .llm_client import DEFAULT_MODEL, LLMClient
 from .tools import ToolRegistry
+
+if False:  # typing only
+    from .skill_forge import ForgeResult, SkillForge  # noqa: F401
 
 SUPPORTED_WORKFLOWS = {"pipeline", "parallel", "review_loop"}
 ToolEventCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
@@ -48,12 +51,25 @@ class AgentSpec:
 
 
 @dataclass(slots=True)
+class SynthesisRequest:
+    requirement: str
+    suggested_name: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requirement": self.requirement,
+            "suggested_name": self.suggested_name,
+        }
+
+
+@dataclass(slots=True)
 class TeamPlan:
     agents: list[AgentSpec]
     workflow: str
     execution_order: list[str]
     max_iterations: int = 1
     rationale: str = ""
+    needs_synthesis: list[SynthesisRequest] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TeamPlan:
@@ -121,12 +137,33 @@ class TeamPlan:
             max_iterations = 1
 
         rationale = str(data.get("rationale", "")).strip()
+
+        raw_synthesis = data.get("needs_synthesis")
+        synthesis: list[SynthesisRequest] = []
+        if isinstance(raw_synthesis, list):
+            for item in raw_synthesis:
+                if isinstance(item, dict):
+                    requirement = str(item.get("requirement", "")).strip()
+                    if not requirement:
+                        continue
+                    suggested_raw = item.get("suggested_name")
+                    suggested = (
+                        str(suggested_raw).strip() if suggested_raw else None
+                    )
+                    synthesis.append(
+                        SynthesisRequest(
+                            requirement=requirement,
+                            suggested_name=suggested or None,
+                        )
+                    )
+
         return cls(
             agents=agents,
             workflow=workflow,
             execution_order=order,
             max_iterations=max_iterations,
             rationale=rationale,
+            needs_synthesis=synthesis,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -147,6 +184,7 @@ class TeamPlan:
                 }
                 for spec in self.agents
             ],
+            "needs_synthesis": [s.to_dict() for s in self.needs_synthesis],
         }
 
 
@@ -160,6 +198,7 @@ class AgentFactory:
         temperature: float = 0.1,
         tool_registry: ToolRegistry | None = None,
         llm_mode: str | None = None,
+        skill_forge: Any = None,
     ) -> None:
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         self.model = model
@@ -167,6 +206,8 @@ class AgentFactory:
         self.temperature = temperature
         self.tool_registry = tool_registry
         self.llm_mode = llm_mode
+        self.skill_forge = skill_forge
+        self.synthesis_log: list[dict[str, Any]] = []
         self.client = LLMClient(
             model=self.model,
             max_tokens=self.max_tokens,
@@ -187,13 +228,109 @@ class AgentFactory:
         plan = TeamPlan.from_dict(plan_data)
         effective_mode = await self._safe_resolve_mode()
         plan = self._apply_planning_policies(cleaned_task, plan, effective_mode=effective_mode)
+
+        if plan.needs_synthesis:
+            await self._run_synthesis_stage(plan)
+
         self.logger.info(
-            "Created team: workflow=%s agents=%s mode=%s",
+            "Created team: workflow=%s agents=%s mode=%s synthesis=%d",
             plan.workflow,
             [agent.name for agent in plan.agents],
             effective_mode,
+            len(plan.needs_synthesis),
         )
         return plan
+
+    async def _run_synthesis_stage(self, plan: TeamPlan) -> None:
+        """Fulfill plan.needs_synthesis by invoking SkillForge.
+
+        Each successful forge adds the new tool to whichever agents
+        asked for it via `suggested_name` in their allowed_tools, or —
+        if none did — leaves it globally available via the registry.
+        Failures are logged and skipped; the run proceeds with whatever
+        tools did synthesize successfully (or none of them).
+        """
+        if self.skill_forge is None:
+            self.logger.warning(
+                "Plan requested synthesis but no SkillForge is attached; "
+                "skipping %d synthesis request(s).",
+                len(plan.needs_synthesis),
+            )
+            self.synthesis_log.extend(
+                {
+                    "requirement": req.requirement,
+                    "success": False,
+                    "error": "no SkillForge attached",
+                }
+                for req in plan.needs_synthesis
+            )
+            return
+
+        for request in plan.needs_synthesis:
+            try:
+                result = await self.skill_forge.forge(request.requirement)
+            except Exception:
+                self.logger.exception(
+                    "SkillForge raised on requirement: %s", request.requirement
+                )
+                self.synthesis_log.append(
+                    {
+                        "requirement": request.requirement,
+                        "suggested_name": request.suggested_name,
+                        "success": False,
+                        "error": "forge raised an exception",
+                    }
+                )
+                continue
+
+            entry: dict[str, Any] = {
+                "requirement": request.requirement,
+                "suggested_name": request.suggested_name,
+                "success": bool(result.success),
+                "registered": bool(result.registered),
+                "attempts": len(result.attempts),
+            }
+            if not result.success or not result.registered or result.tool_spec is None:
+                entry["error"] = result.error or "forge did not register a tool"
+                self.logger.info(
+                    "Synthesis failed for '%s': %s",
+                    request.requirement,
+                    entry["error"],
+                )
+                self.synthesis_log.append(entry)
+                continue
+
+            tool_name = result.tool_spec.name
+            entry["tool_name"] = tool_name
+            self.synthesis_log.append(entry)
+
+            # Wire the new tool to whichever agent asked for it. We match by
+            # suggested_name appearing in an agent's allowed_tools (the
+            # Director's way of saying "this agent will use it"). If nothing
+            # matches, the tool is globally available via the registry but
+            # not assigned — planner can still reference it via a rerun.
+            target = request.suggested_name or tool_name
+            attached = False
+            for spec in plan.agents:
+                if target and target in (spec.allowed_tools or []):
+                    # Replace the placeholder suggested_name with the
+                    # actual registered name (which may differ).
+                    if tool_name != target:
+                        spec.allowed_tools = [
+                            tool_name if t == target else t
+                            for t in spec.allowed_tools
+                        ]
+                    elif tool_name not in spec.allowed_tools:
+                        spec.allowed_tools.append(tool_name)
+                    attached = True
+
+            if not attached:
+                self.logger.info(
+                    "Synthesized tool '%s' was registered but no agent "
+                    "referenced it in allowed_tools; it remains globally "
+                    "available in the registry.",
+                    tool_name,
+                )
 
     async def _safe_resolve_mode(self) -> str | None:
         resolver = getattr(self.client, "resolve_mode", None)
@@ -312,7 +449,22 @@ class AgentFactory:
             "- When a tool has an access restriction (shown as `restricted to [...]`), "
             "assign it only to agents whose name matches one of the listed names. "
             "If the task needs such a tool, name the agent accordingly (e.g., name the "
-            "researcher 'researcher' instead of 'analyst')."
+            "researcher 'researcher' instead of 'analyst').\n"
+            "\nRuntime tool synthesis (OPTIONAL):\n"
+            "- If the task requires a capability that is clearly NOT satisfiable by "
+            "any listed tool, you MAY add a top-level \"needs_synthesis\" array to "
+            "request runtime tool creation:\n"
+            '  "needs_synthesis": [{"requirement": "what the tool must do",\n'
+            '                       "suggested_name": "snake_case_name"}]\n'
+            "- The system will try to synthesize and test each tool before execution. "
+            "If synthesis succeeds, the tool is attached to whichever agent has "
+            "`suggested_name` in its allowed_tools. If it fails, the run proceeds "
+            "without that tool — so design the team to degrade gracefully.\n"
+            "- Use synthesis only for pure-Python, deterministic capabilities "
+            "(numeric conversion, string reshaping, lightweight parsing). Do NOT "
+            "request synthesis for tasks needing network, filesystem, or external "
+            "services — those belong to MCP servers.\n"
+            "- Keep suggested_name unique — do not collide with any listed tool."
         )
         raw = await self.client.generate(messages=messages, system=system_prompt)
         if not raw:
