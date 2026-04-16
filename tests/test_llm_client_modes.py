@@ -4,6 +4,7 @@ import pytest
 
 from wanxiang.core.llm_client import (
     DEFAULT_LLM_CALL_TIMEOUT_S,
+    DEFAULT_TIMEOUT_RETRY_WAITS_S,
     LLMClient,
 )
 
@@ -70,7 +71,11 @@ def test_invalid_timeout_rejected() -> None:
 def test_timeout_wraps_slow_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     """If the underlying dispatch never returns, wait_for converts the
     TimeoutError into a RuntimeError with a recognizable keyword."""
-    client = LLMClient(api_key="k", mode="api", llm_call_timeout_s=0.2)
+    # Disable retries so this test isolates the single-attempt timeout
+    # path (separate retry-ladder tests cover multi-attempt behavior).
+    client = LLMClient(
+        api_key="k", mode="api", llm_call_timeout_s=0.2, timeout_retry_waits_s=()
+    )
 
     async def _hang(**kwargs: object) -> dict:
         await asyncio.sleep(5.0)
@@ -134,3 +139,117 @@ def test_terminate_subprocess_kills_running() -> None:
     asyncio.run(_terminate_subprocess(_FakeRunningProc()))
     assert killed["flag"] is True
     assert waited["flag"] is True
+
+
+# ---- timeout-only retry ladder -------------------------------------------
+
+
+def test_default_retry_ladder_is_30_then_60() -> None:
+    assert DEFAULT_TIMEOUT_RETRY_WAITS_S == (30.0, 60.0)
+
+
+def test_negative_retry_wait_rejected() -> None:
+    with pytest.raises(ValueError, match="non-negative"):
+        LLMClient(
+            api_key="k",
+            mode="api",
+            timeout_retry_waits_s=(30.0, -5.0),
+        )
+
+
+def test_retry_eventually_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hang on first attempt, succeed on second. Retry must fire and
+    the final return value must match the second attempt."""
+    client = LLMClient(
+        api_key="k",
+        mode="api",
+        llm_call_timeout_s=0.2,
+        timeout_retry_waits_s=(0.0,),  # zero-sleep retry keeps test fast
+    )
+
+    call_count = {"n": 0}
+
+    async def _flaky(**kwargs: object) -> dict:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            await asyncio.sleep(5.0)  # forces first attempt to time out
+            return {}
+        return {"content": [{"type": "text", "text": "recovered"}]}
+
+    monkeypatch.setattr(client, "_dispatch_generate_response", _flaky)
+
+    result = asyncio.run(
+        client.generate_response(messages=[{"role": "user", "content": "hi"}])
+    )
+    assert result["content"][0]["text"] == "recovered"
+    assert call_count["n"] == 2
+
+
+def test_retry_exhausted_raises_with_attempt_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When every attempt times out, the final RuntimeError carries
+    the attempt count so mining can see "after N attempts"."""
+    client = LLMClient(
+        api_key="k",
+        mode="api",
+        llm_call_timeout_s=0.1,
+        timeout_retry_waits_s=(0.0, 0.0),  # max_attempts = 3
+    )
+
+    async def _always_hangs(**kwargs: object) -> dict:
+        await asyncio.sleep(5.0)
+        return {}
+
+    monkeypatch.setattr(client, "_dispatch_generate_response", _always_hangs)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(client.generate_response(messages=[{"role": "user", "content": "hi"}]))
+
+    msg = str(excinfo.value)
+    assert "LLM call exceeded" in msg
+    assert "after 3 attempts" in msg
+    assert "Mode: api" in msg
+
+
+def test_non_timeout_errors_do_not_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only asyncio.TimeoutError should trigger retry. A real error
+    (bad JSON, auth failure) should propagate immediately."""
+    client = LLMClient(
+        api_key="k",
+        mode="api",
+        llm_call_timeout_s=2.0,
+        timeout_retry_waits_s=(0.0, 0.0),
+    )
+
+    call_count = {"n": 0}
+
+    async def _raises_logic_error(**kwargs: object) -> dict:
+        call_count["n"] += 1
+        raise ValueError("bad JSON from LLM")
+
+    monkeypatch.setattr(client, "_dispatch_generate_response", _raises_logic_error)
+
+    with pytest.raises(ValueError, match="bad JSON"):
+        asyncio.run(client.generate_response(messages=[{"role": "user", "content": "hi"}]))
+
+    # Must not have retried; only one attempt.
+    assert call_count["n"] == 1
+
+
+def test_no_retries_configured_behaves_as_single_shot(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = LLMClient(
+        api_key="k",
+        mode="api",
+        llm_call_timeout_s=0.1,
+        timeout_retry_waits_s=(),  # no retries
+    )
+
+    async def _hang(**kwargs: object) -> dict:
+        await asyncio.sleep(5.0)
+        return {}
+
+    monkeypatch.setattr(client, "_dispatch_generate_response", _hang)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(client.generate_response(messages=[{"role": "user", "content": "hi"}]))
+
+    assert "after 1 attempts" in str(excinfo.value)

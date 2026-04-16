@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -16,6 +17,13 @@ VALID_LLM_MODES = {"auto", "api", "cli"}
 # buffer for occasional slow responses but bounds silent TPM-rate-limit
 # holds that would otherwise stall parallel workflows for 15+ minutes.
 DEFAULT_LLM_CALL_TIMEOUT_S = 120.0
+
+# Timeout-only retry ladder. If a single LLM call trips the 120s cap,
+# sleep N seconds then retry — TPM holds are typically transient (the
+# rate-limit window rotates on the minute). Only asyncio.TimeoutError
+# triggers retry; real LLM errors (bad JSON, auth failures) pass through.
+# Two retries → three attempts total → worst case 3×120 + 30 + 60 = 450s.
+DEFAULT_TIMEOUT_RETRY_WAITS_S: tuple[float, ...] = (30.0, 60.0)
 
 # Claude CLI auto-loads user-level MCP servers (Notion / Gmail / etc.).
 # When Wanxiang uses `claude -p` as a text-generation backend we don't
@@ -71,6 +79,7 @@ class LLMClient:
         oauth_token: str | None = None,
         mode: str | None = None,
         llm_call_timeout_s: float = DEFAULT_LLM_CALL_TIMEOUT_S,
+        timeout_retry_waits_s: tuple[float, ...] = DEFAULT_TIMEOUT_RETRY_WAITS_S,
     ) -> None:
         self.model = model
         self.max_tokens = max_tokens
@@ -84,10 +93,14 @@ class LLMClient:
             )
         if llm_call_timeout_s <= 0:
             raise ValueError("llm_call_timeout_s must be positive")
+        if any(w < 0 for w in timeout_retry_waits_s):
+            raise ValueError("timeout_retry_waits_s entries must be non-negative")
         self.mode = resolved_mode
         self.llm_call_timeout_s = llm_call_timeout_s
+        self.timeout_retry_waits_s = tuple(timeout_retry_waits_s)
         self._claude_bin = shutil.which("claude")
         self._cli_auth_cache: bool | None = None
+        self.logger = logging.getLogger("wanxiang.llm_client")
 
     async def generate(self, messages: list[dict[str, Any]], system: str | None = None) -> str:
         response = await self.generate_response(messages=messages, system=system)
@@ -107,19 +120,47 @@ class LLMClient:
         tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         mode = await self.resolve_mode(require_tools=bool(tools))
-        try:
-            return await asyncio.wait_for(
-                self._dispatch_generate_response(
-                    mode=mode, messages=messages, system=system, tools=tools
-                ),
-                timeout=self.llm_call_timeout_s,
-            )
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(
-                f"LLM call exceeded {self.llm_call_timeout_s:.0f}s timeout. "
-                f"Likely TPM rate-limit hold (CLI mode) or service degradation. "
-                f"Mode: {mode}, Model: {self.model}"
-            ) from exc
+        max_attempts = len(self.timeout_retry_waits_s) + 1
+        last_exc: asyncio.TimeoutError | None = None
+
+        for attempt_index in range(max_attempts):
+            try:
+                return await asyncio.wait_for(
+                    self._dispatch_generate_response(
+                        mode=mode, messages=messages, system=system, tools=tools
+                    ),
+                    timeout=self.llm_call_timeout_s,
+                )
+            except asyncio.TimeoutError as exc:
+                last_exc = exc
+                if attempt_index < len(self.timeout_retry_waits_s):
+                    wait_s = self.timeout_retry_waits_s[attempt_index]
+                    self.logger.warning(
+                        "LLM call timed out after %.0fs "
+                        "(attempt %d/%d, mode=%s); retrying in %.0fs",
+                        self.llm_call_timeout_s,
+                        attempt_index + 1,
+                        max_attempts,
+                        mode,
+                        wait_s,
+                    )
+                    if wait_s > 0:
+                        await asyncio.sleep(wait_s)
+                    continue
+                # Out of retries — surface as RuntimeError with a stable
+                # "LLM call exceeded" prefix so trace_mining can cluster.
+                raise RuntimeError(
+                    f"LLM call exceeded {self.llm_call_timeout_s:.0f}s timeout "
+                    f"after {max_attempts} attempts. "
+                    f"Likely sustained TPM rate-limit hold or service degradation. "
+                    f"Mode: {mode}, Model: {self.model}"
+                ) from exc
+
+        # Defensive: loop must return or raise; this line protects against
+        # future refactors silently dropping a branch.
+        raise RuntimeError(
+            "LLM call exhausted retries without a final result."
+        ) from last_exc
 
     async def _dispatch_generate_response(
         self,
