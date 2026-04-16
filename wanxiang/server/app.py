@@ -10,8 +10,11 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 
+from ..core.agent import AgentConfig, BaseAgent
 from ..core.builtin_tools import create_default_registry
 from ..core.mcp_loader import MCPPool, load_mcp_declarations
+from ..core.sandbox import SandboxExecutor
+from ..core.skill_forge import SkillForge
 from .mcp_status import probe_mcp_status
 from .models import (
     MCPStatusResponse,
@@ -27,9 +30,13 @@ logger = logging.getLogger("wanxiang.server")
 
 UI_FILE = Path(__file__).resolve().parents[2] / "wanxiang-ui.jsx"
 MCP_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "mcp.yaml"
+SKILL_SYNTHESIZER_YAML = (
+    Path(__file__).resolve().parents[2] / "configs" / "agents" / "skill_synthesizer.yaml"
+)
 
 _run_manager: RunManager | None = None
 _mcp_pool: MCPPool | None = None
+_skill_forge: SkillForge | None = None
 
 
 def _get_run_manager() -> RunManager:
@@ -40,7 +47,7 @@ def _get_run_manager() -> RunManager:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    global _run_manager, _mcp_pool
+    global _run_manager, _mcp_pool, _skill_forge
     tool_registry = create_default_registry()
     _mcp_pool = MCPPool()
 
@@ -63,9 +70,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             MCP_CONFIG_PATH,
         )
 
+    llm_mode = os.getenv("WANXIANG_LLM_MODE")
+    _skill_forge = _build_skill_forge(
+        tool_registry=tool_registry, llm_mode=llm_mode
+    )
+
     _run_manager = RunManager(
-        llm_mode=os.getenv("WANXIANG_LLM_MODE"),
+        llm_mode=llm_mode,
         tool_registry=tool_registry,
+        skill_forge=_skill_forge,
     )
 
     try:
@@ -75,6 +88,56 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await _mcp_pool.close()
         _run_manager = None
         _mcp_pool = None
+        _skill_forge = None
+
+
+def _build_skill_forge(
+    *, tool_registry, llm_mode: str | None
+) -> SkillForge | None:
+    """Wire up SynthesizerAgent + SandboxExecutor + SkillForge.
+
+    Disabled by default. Set WANXIANG_ENABLE_SKILL_FORGE=1 to turn on.
+    If the skill_synthesizer YAML is missing or malformed, logs a warning
+    and returns None — the server still runs, only synthesis requests
+    degrade gracefully.
+    """
+    enable_flag = os.getenv("WANXIANG_ENABLE_SKILL_FORGE", "").strip().lower()
+    if enable_flag not in {"1", "true", "yes", "on"}:
+        logger.info(
+            "SkillForge disabled (set WANXIANG_ENABLE_SKILL_FORGE=1 to enable)"
+        )
+        return None
+    if not SKILL_SYNTHESIZER_YAML.exists():
+        logger.warning(
+            "SKILL_FORGE enabled but %s is missing; running without forge",
+            SKILL_SYNTHESIZER_YAML,
+        )
+        return None
+
+    try:
+        synth_config = AgentConfig.from_yaml(SKILL_SYNTHESIZER_YAML)
+    except Exception:
+        logger.exception(
+            "Failed to load SkillSynthesizer config from %s", SKILL_SYNTHESIZER_YAML
+        )
+        return None
+
+    synthesizer = BaseAgent(
+        config=synth_config,
+        tool_registry=tool_registry,
+        llm_mode=llm_mode,
+    )
+    sandbox = SandboxExecutor(
+        timeout_s=float(os.getenv("WANXIANG_SANDBOX_TIMEOUT_S", "30")),
+    )
+    forge = SkillForge(
+        sandbox=sandbox,
+        registry=tool_registry,
+        synthesizer=synthesizer,
+        max_retries=int(os.getenv("WANXIANG_SKILL_FORGE_RETRIES", "3")),
+    )
+    logger.info("SkillForge ready: synthesizer=%s", synth_config.name)
+    return forge
 
 
 app = FastAPI(title="Wanxiang Server", version="0.1.0", lifespan=lifespan)
@@ -158,6 +221,30 @@ async def get_mcp_pool_status() -> dict:
     return {
         "ready": True,
         "servers": _mcp_pool.registered_tools,
+    }
+
+
+@app.get("/api/skill-forge/status")
+async def get_skill_forge_status() -> dict:
+    """Report whether SkillForge is wired up this run."""
+    if _skill_forge is None:
+        return {
+            "ready": False,
+            "reason": (
+                "SkillForge not enabled. Set WANXIANG_ENABLE_SKILL_FORGE=1 "
+                "and ensure configs/agents/skill_synthesizer.yaml exists."
+            ),
+        }
+    synthesizer_name = getattr(
+        getattr(_skill_forge.synthesizer, "config", None), "name", "unknown"
+    )
+    return {
+        "ready": True,
+        "synthesizer": synthesizer_name,
+        "max_retries": _skill_forge.max_retries,
+        "recent_synthesis_count": len(
+            getattr(_get_run_manager().factory, "synthesis_log", [])
+        ),
     }
 
 

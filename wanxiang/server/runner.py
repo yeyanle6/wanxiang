@@ -36,6 +36,7 @@ class RunManager:
         factory: AgentFactory | None = None,
         llm_mode: str | None = None,
         tool_registry: Any = None,
+        skill_forge: Any = None,
     ) -> None:
         if factory is not None:
             self.factory = factory
@@ -48,6 +49,7 @@ class RunManager:
             self.factory = AgentFactory(
                 tool_registry=registry,
                 llm_mode=llm_mode,
+                skill_forge=skill_forge,
             )
         self._runs: dict[str, _RunState] = {}
         self._lock = asyncio.Lock()
