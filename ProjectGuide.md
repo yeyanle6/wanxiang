@@ -250,6 +250,60 @@ Evaluation rules for THIS run (tool-aware):
 
 **未接线**：TierManager 尚未接入 RunManager 的事件流。Phase 6.3 做接线，6.4 做 mining 驱动的 SkillForge 自动触发。等真实 run 数据积累够了再做。
 
+### Phase 7：生产数据驱动的韧性优化（真正把万象跑起来）
+**目标**：Phase 1-6 都是架构演进，Phase 7 第一次让万象在真实任务上跑——跑真实的研究任务，遇到真实的基础设施限制，用 Phase 5 的 mining 作为测量仪器，分三轮定向修复。
+
+这一阶段的独特性在于：**每一个决策都来自可观测的生产数据，每一个修复都用 mining 报告对比验证**。它把 Phase 5 "离线观察层" 的承诺兑现了——mining 不只是写报告，它是优化系统的仪器。
+
+**触发事件**：跑第一个真实搜索任务时发现 researcher_b 在 parallel workflow 里 silent hang 14 分钟（0 tool_calls + 返回 "✅ Research complete." 5 个字符）。第二批 5 个真实任务，第一个跑了 36 分钟仍未完成。
+
+**根因追踪**：
+- `ps -p` 查到 `claude -p` 子进程活着
+- `lsof` 显示 TCP ESTABLISHED 到 Anthropic 服务器
+- CPU 时间 1 分钟（36 分钟墙钟）—— 99% 在等 I/O
+- 不是本地挂起，是服务端静默 hold 请求
+
+**假设**：Claude Max 订阅有账户级 tokens-per-minute (TPM) 限额，跨所有并发 `claude -p` session 共享。超过时 Anthropic 后端**不返 429 错误**（消费者产品设计哲学），而是 silent queuing。Parallel workflow 同时起 2 个 researcher 恰好触发。
+
+**Mining 验证**：`slowest_agents` 前 5 名全是 parallel workflow 的 researcher（11-16 分钟），review_loop 的单 agent 只有 7 分钟。区分度清晰到足以锁定根因。
+
+分三波修复，每一波跑同一批 5 个真实研究任务对比验证：
+
+**7.1 基础设施（3 个 commit）**：
+- `web_search` 从 native-only 改成 `ddgs`（DuckDuckGo）内置 registry 工具。解决 CLI 模式下 native tools 被降级剥离的问题——现在 CLI 模式也有搜索
+- `LLMClient.generate_response` 加 120s 硬超时（默认）。超时转成带 "LLM call exceeded" 前缀的 RuntimeError，让 mining 能聚类。CLI subprocess 在 cancel 时用 `_terminate_subprocess` helper 清理，防止孤儿进程继续吃 TPM（真实观察到过 4 个孤儿 claude 进程）
+- `trace_mining.py` 修 builtin web_search 分类 bug（空 group fall-through 到 native 的逻辑）+ 添加 "LLM call exceeded" 关键词到 `DEFAULT_FAILURE_KEYWORDS`
+
+这一波跑完：5 个任务 16 分钟跑完（vs 之前 30+ 分钟单任务都跑不完），success 2/5，`LLM call exceeded` 触发 15 次——silent hang 变成快速明确失败，但 TPM 问题本身还在。
+
+**7.2 错峰（1 个 commit，D18）**：`_run_parallel` 每个分支启动前等 `i * parallel_stagger_s` 秒（默认 8s）。第 0 个立即启动，第 1 个等 8s，让第一个 LLM 调用的初始响应先把 TPM 峰值过掉，第二个分支再跟上。
+
+对比：success 持平 2/5，**non-error 2/5 → 3/5**（Task 4 VLA 从 error 翻盘到 success），`LLM call exceeded` 15 → 10（-33%）。Task 4 的翻盘是 stagger 假设的直接证据。
+
+**7.3 重试阶梯（1 个 commit，D19）**：`generate_response` 循环最多 3 次，只对 `asyncio.TimeoutError` 重试（非 timeout 错误如 bad JSON / auth 失败直接抛）。默认等待阶梯 30s → 60s。关键约束：**不是所有失败都重试**——真实业务错误不值得等。
+
+对比：**success 2/5 → 3/5**（Task 1 sim-to-real 从 error 变 success，耗时 168s → 520s ≈ 1 次 timeout + 30s wait + 成功调用，直接证据），**non-error 3/5 → 4/5**，`LLM call exceeded` 10 → 3（-70%）。
+
+**三代对比的完整数据**：
+
+| 指标 | 7.1 only | 7.2 stagger | 7.3 +retry |
+|---|---|---|---|
+| strict success | 2/5 | 2/5 | **3/5** |
+| non-error | 2/5 | 3/5 | **4/5** |
+| `LLM call exceeded` | 15 | 10 | **3** |
+| 真实重试触发次数 | — | — | 7 |
+| slowest researcher | 176s | 156s | 125s |
+
+**为什么在 7.3 停下来**：剩下那 1/5 的 Task 5（Nav2）在 7.3 里跑满 450s（= 3×120 + 30 + 60，重试阶梯全部耗尽）仍然失败。**耗尽时间不是瞬时 TPM hold，是持续性 quota exhaustion**——订阅配额在那段时间真的没有空间。再加重试是指数退避的指数增长，收益递减但代价线性增加。工程上到了收益拐点。
+
+**失败模式的四层分类**（Phase 7 最重要的认知产出）：
+1. **Burst collision**（并发峰值）—— stagger 解决
+2. **Transient hold**（瞬时 TPM hold）—— retry 解决
+3. **Infra issue**（CLI 认证 / 网络 / MCP 配置）—— 现有错误信息已清楚
+4. **Sustained quota exhaustion**（配额真的用完）—— 工程层无解，是使用边界
+
+第 4 类是 Phase 7 独有的发现。它告诉你万象的使用边界：**不是任何时刻都能跑并发研究任务**，某些时段你的 Max 订阅 TPM 池就是不够。
+
 ---
 
 ## 3. 关键架构决策（Decision Log）
@@ -521,6 +575,58 @@ Evaluation rules for THIS run (tool-aware):
 
 **测试验证**：`test_demotion_priority_over_promotion` 明确 assert 在同一次 `record_result` 调用中，即使同时满足升级和降级条件，降级优先。`test_sliding_window_forgets_old_results` 验证旧失败被推出窗口后不再触发降级。
 
+### D18 · Parallel 错峰启动：对抗 TPM burst
+**问题**：Parallel workflow 同时启动 N 个 researcher，每个 researcher 的第一次 LLM 调用在同一 tick 里发出。这个瞬时峰值是 TPM 超限的主要触发点——`claude -p` 的 OAuth 共享账户 quota，两个并发请求直接打爆 60 秒窗口。
+
+**候选**：
+- (A) 全局限速：所有 LLM 调用走一个 semaphore，同时最多 1 个 in-flight
+- (B) 启动错峰：parallel 分支间加启动间隔（stagger），让第一个调用的峰值过了再发起第二个
+- (C) 改 Director prompt：CLI 模式下禁止 parallel workflow，强制降级为 pipeline
+- (D) 什么都不做，只加 hard timeout 兜底
+
+**选择**：B，默认 8 秒。
+
+**理由**：
+- A 太激进——完全抹杀 parallel 的并发收益，review_loop 和 pipeline 也被拖慢
+- C 改变 Director 的工作流选择权，失去 parallel 的"多角度独立研究"特性
+- D 是已做的 hard timeout，证明不够——只把 silent hang 变成快速失败，不改善成功率
+- B 是最小干预：只影响 parallel，只影响启动时序，完全保留并发语义
+
+**代价分析**：parallel 总耗时增加 `(N-1) * stagger_s`。2 个分支 8s = +8s；3 个分支 = +16s。相比一次 TPM collision 15-30 分钟 hang 完全可接受。
+
+**真实数据验证**：Task 4 (VLA) 在 7.1 是 error，在 7.2 变 success，耗时持平 200s。两个 researcher 不同时启动，第二个的 LLM 调用避开了第一个的峰值——**这是区别于"其他原因成功"的直接证据**（同一任务，同一 agent 名字，同样工具，只差 stagger）。
+
+**实现细节**：`WorkflowEngine.__init__` 加可选 kwarg `parallel_stagger_s: float = 8.0`。`_run_parallel` 里每个 `_execute_parallel_agent(name, i * stagger)`。此改动触动 immutable core（`pipeline.py`），但只是**新增可选 kwarg + 内部行为添加**，不改变任一 mode 的对外语义。签名锁定测试继续通过。用 `ALLOW_CORE_CHANGE=1` 提交，并更新 `IMMUTABLE_CORE.md` 说明"可选 kwarg 允许被添加"。
+
+### D19 · Timeout-only 重试阶梯：对抗 transient hold
+**问题**：D17 之前的 hard timeout 把 silent hang 变成了快速 RuntimeError，但把**短暂的 TPM hold**（30-60s 就能自愈的那种）也直接判死。一个本可以等一会儿就成功的调用被立刻失败了。
+
+**候选**：
+- (A) 所有异常都重试 N 次，指数退避
+- (B) 只对 `asyncio.TimeoutError` 重试，非 timeout 错误立刻抛
+- (C) 重试次数 5+，等待时间更长（60/120/240s）
+- (D) 不做重试，交给调用方决定
+
+**选择**：B，重试阶梯 `(30.0, 60.0)`（2 次重试，最多 3 次尝试）。
+
+**理由**：
+- A 不对——真实业务错误（bad JSON、auth 失败、ValueError 等）重试没意义，只会多花 60-90s 等待得到同样的失败。mining 的失败分类也会被稀释
+- C 收益递减——实测里 7.3 跑批的 Task 5 在 90 秒等待后仍然失败，说明 sustained quota exhaustion 不是重试能救的。再加等待时间只是让失败来得更慢
+- D 在 Phase 4-6 一直是这个模式，但真实数据（Task 1 sim-to-real）告诉我们调用方不会自动恢复，因为每个 agent 独立运行
+- B 是性价比最优：30+60=90s 最坏额外等待，恰好覆盖 Claude TPM 窗口的一个常规释放周期（按经验 Anthropic TPM 以 60s 窗口滑动）
+
+**关键约束**：
+- 只重试 `asyncio.TimeoutError`。其他异常用 `except asyncio.TimeoutError as exc:` 精准捕获，其他 `raise` 照常穿透
+- 重试次数可配置（`timeout_retry_waits_s` tuple）。空 tuple 等于单次尝试，不重试——测试里会用
+- Logger.warning 每次重试，包含 attempt N/M + mode + wait_s，让 server log 能看到重试事件
+- 最终失败的 RuntimeError 带 "after N attempts" 后缀——mining 能继续用 "LLM call exceeded" 聚类，同时看到重试最终没救回来
+
+**真实数据验证**：Task 1 sim-to-real 从 error 168s 翻盘到 success 520s。`520 ≈ 120 (timeout) + 30 (wait) + 370 (成功调用，含搜索和合成)`。时间结构完全匹配"一次 timeout + 一次重试成功"的预期。同时全批 `LLM call exceeded` 次数从 10 降到 3（-70%）。
+
+**代价**：最坏情况单次调用 wall-time 从 120s → 450s（3×120 + 30 + 60）。但 mining 显示真实触发的重试只有 7 次（跨 5 个任务），大多数 LLM 调用第一次就成功。期望耗时只增加几秒。
+
+**不做的事**：不做 5 次+ 重试、不做指数退避曲线（`30 * 2^attempt`）。两者收益极低——Task 5 的 450s exhaust 告诉我们：如果 TPM 池真的空了，等多久都没用。这是使用边界，不是工程问题。
+
 ---
 
 ## 4. 偏离原路线图之处
@@ -608,6 +714,8 @@ Evaluation rules for THIS run (tool-aware):
 - `test_immutable_core.py` —— Phase 6.1 签名锁定（28 tests，守住 5 个核心文件的公开接口）
 - `test_tier.py` —— Phase 6.2 信任等级（30 tests，升降级全路径 + 窗口 + 序列化 + 自定义阈值）
 - `test_mcp_client.py` / `test_mcp_bridge.py` / `test_mcp_loader.py` —— MCP 协议、桥接、生命周期
-- `test_llm_client_modes.py` / `test_mcp_status.py` —— 基础设施
+- `test_llm_client_modes.py` —— 基础设施 + Phase 7 韧性测试（18 tests，含 hard timeout + subprocess cleanup + 重试阶梯）
+- `test_pipeline.py` —— workflow 三模式 + Phase 7 parallel stagger（13 tests）
+- `test_mcp_status.py` —— MCP 状态探测
 - `test_server_events.py` / `test_runner_tool_events.py` —— 事件流一致性
 - `tests/fixtures/trace_mining/` —— 5 个手写 run + 审计日志 + 合成日志 fixture
