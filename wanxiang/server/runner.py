@@ -34,6 +34,7 @@ class _RunState:
     events: list[dict[str, Any]] = field(default_factory=list)
     level: int | None = None
     source: str = "user"
+    probe: bool = False
 
 
 class RunManager:
@@ -112,13 +113,14 @@ class RunManager:
         *,
         level: int | None = None,
         source: str = "user",
+        probe: bool = False,
     ) -> str:
         cleaned_task = task.strip()
         if not cleaned_task:
             raise ValueError("Task cannot be empty.")
 
         run_id = str(uuid4())
-        state = _RunState(user_task=cleaned_task, level=level, source=source)
+        state = _RunState(user_task=cleaned_task, level=level, source=source, probe=probe)
         async with self._lock:
             self._runs[run_id] = state
             state.task = asyncio.create_task(self._execute_run(run_id, cleaned_task))
@@ -150,7 +152,10 @@ class RunManager:
 
         try:
             llm_mode_effective = await self._resolve_factory_mode()
-            plan = await self.factory.create_team(task)
+            if state is not None and state.probe:
+                plan = await self.factory.create_team_probe(task)
+            else:
+                plan = await self.factory.create_team(task)
             await self._publish(
                 run_id,
                 RunEvent.run_started(

@@ -7,6 +7,14 @@ from pydantic import BaseModel, Field
 
 class RunRequest(BaseModel):
     task: str = Field(..., min_length=1, description="Task description for the run.")
+    probe: bool = Field(
+        default=False,
+        description=(
+            "Probe mode: skip Director LLM + reviewer injection, run a single "
+            "responder agent. For quick liveness probes or autoschool L0/L1 tasks; "
+            "not recommended for real work."
+        ),
+    )
 
 
 class RunResponse(BaseModel):

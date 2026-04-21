@@ -56,6 +56,40 @@ class AgentFactory:
             logger=self.logger,
         )
 
+    async def create_team_probe(self, task: str) -> TeamPlan:
+        """Zero-LLM bypass that returns a hardcoded 1-agent pipeline plan.
+
+        For autoschool L0/L1 probe tasks where the review-loop overhead
+        dwarfs task complexity. Skips the Director LLM call and the
+        policy layer's reviewer injection entirely — 1 LLM call per run
+        instead of the normal 3+.
+
+        Do not expose via the public run API — policies exist for a
+        reason and user-facing tasks should benefit from them.
+        """
+        cleaned_task = task.strip()
+        if not cleaned_task:
+            raise ValueError("Task must be non-empty.")
+
+        agent = AgentSpec(
+            name="responder",
+            duty="Answer the probe task directly.",
+            base_identity=(
+                "You are a direct responder. Produce the exact requested output "
+                "concisely. Do not ask for clarification. Do not invoke tools "
+                "unless strictly required by the task."
+            ),
+        )
+        plan = TeamPlan(
+            agents=[agent],
+            workflow="pipeline",
+            execution_order=["responder"],
+            max_iterations=1,
+            rationale="probe-bypass: Director LLM + policies skipped",
+        )
+        self.logger.info("Created probe team (1 agent, pipeline, no reviewer)")
+        return plan
+
     async def create_team(self, task: str) -> TeamPlan:
         cleaned_task = task.strip()
         if not cleaned_task:

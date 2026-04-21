@@ -249,7 +249,7 @@ async def ui_script() -> FileResponse:
 async def create_run(request: RunRequest) -> RunResponse:
     rm = _get_run_manager()
     try:
-        run_id = await rm.start_run(request.task)
+        run_id = await rm.start_run(request.task, probe=request.probe)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return RunResponse(run_id=run_id)
