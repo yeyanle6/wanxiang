@@ -16,6 +16,7 @@ from ..core.agent import AgentConfig, BaseAgent
 from ..core.builtin_tools import create_default_registry
 from ..core.gap_detector import detect_synthesis_candidates
 from ..core.mcp_loader import MCPPool, load_mcp_declarations
+from ..core.outcome_tagger import tag_run
 from ..core.sandbox import SandboxExecutor
 from ..core.skill_forge import SkillForge
 from ..core.skill_loader import approve_skill, list_skills, load_approved_skills
@@ -80,6 +81,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     RUNS_JSONL_PATH,
                     migrated,
                 )
+        tagged = _retag_untagged_runs(_storage)
+        if tagged:
+            logger.info("Assigned outcome to %d run(s) with outcome=NULL", tagged)
 
     if MCP_CONFIG_PATH.exists():
         try:
@@ -147,6 +151,27 @@ def _should_bootstrap_storage(storage: Storage) -> bool:
     Idempotence guard — re-running the server must not duplicate history.
     """
     return len(storage.list_runs(limit=1)) == 0
+
+
+def _retag_untagged_runs(storage: Storage) -> int:
+    """Compute outcome for any run whose outcome is still NULL.
+
+    Runs imported via import_jsonl land without an outcome label. This
+    walks the DB once per startup and fills in the blanks. It's a no-op
+    when every run is already tagged, so paying the scan on every boot
+    is cheap.
+    """
+    count = 0
+    for run in storage.list_runs(limit=10_000):
+        if run.outcome is not None:
+            continue
+        full = storage.get_run(run.run_id, with_events=True)
+        if full is None:
+            continue
+        outcome = tag_run(full.events or [], full.final_status)
+        storage.update_outcome(run.run_id, outcome)
+        count += 1
+    return count
 
 
 def _build_skill_forge(

@@ -56,6 +56,13 @@ def tag_run(events: Iterable[dict[str, Any]], final_status: str | None) -> str:
         # Success final status but some non-matching error text → partial.
         return OUTCOME_PARTIAL if error_strings else OUTCOME_SUCCESS
 
+    # review_loop exhausted max_iterations with reviewer still unhappy →
+    # content was produced but below target quality. This is the 'partial'
+    # bucket, not 'unknown'. Without this mapping graduation judges that
+    # read review_loop success rates would see most of them as 'unknown'.
+    if status == "needs_revision":
+        return OUTCOME_PARTIAL
+
     return OUTCOME_UNKNOWN
 
 

@@ -90,6 +90,17 @@ class TestPartial:
         # present → partial.
         assert tag_run(events, "success") == OUTCOME_PARTIAL
 
+    def test_needs_revision_final_status_maps_to_partial(self):
+        # review_loop exhausted max_iterations with reviewer still unhappy.
+        events = [
+            {"type": "agent_completed", "data": {"agent": "writer", "status": "success"}},
+            {"type": "agent_completed", "data": {"agent": "reviewer", "status": "needs_revision"}},
+        ]
+        assert tag_run(events, "needs_revision") == OUTCOME_PARTIAL
+
+    def test_needs_revision_with_no_events(self):
+        assert tag_run([], "needs_revision") == OUTCOME_PARTIAL
+
 
 class TestUnknown:
     def test_no_success_no_errors(self):
