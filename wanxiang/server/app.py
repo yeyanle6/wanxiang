@@ -19,6 +19,7 @@ from ..core.mcp_loader import MCPPool, load_mcp_declarations
 from ..core.sandbox import SandboxExecutor
 from ..core.skill_forge import SkillForge
 from ..core.skill_loader import approve_skill, list_skills, load_approved_skills
+from ..core.storage import Storage
 from ..core.tier import TierManager
 from ..core.trace_mining import mine_traces
 from .mcp_status import probe_mcp_status
@@ -48,10 +49,13 @@ SKILL_SYNTHESIZER_YAML = (
     Path(__file__).resolve().parents[2] / "configs" / "agents" / "skill_synthesizer.yaml"
 )
 SKILLS_DIR = Path(__file__).resolve().parents[2] / "skills"
+STORAGE_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "wanxiang.db"
+RUNS_JSONL_PATH = Path(__file__).resolve().parents[2] / "data" / "runs.jsonl"
 
 _run_manager: RunManager | None = None
 _mcp_pool: MCPPool | None = None
 _skill_forge: SkillForge | None = None
+_storage: Storage | None = None
 
 
 def _get_run_manager() -> RunManager:
@@ -62,9 +66,20 @@ def _get_run_manager() -> RunManager:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    global _run_manager, _mcp_pool, _skill_forge
+    global _run_manager, _mcp_pool, _skill_forge, _storage
     tool_registry = create_default_registry()
     _mcp_pool = MCPPool()
+
+    if _storage_enabled():
+        _storage = Storage(STORAGE_DB_PATH)
+        if _should_bootstrap_storage(_storage):
+            migrated = _storage.import_jsonl(RUNS_JSONL_PATH)
+            if migrated:
+                logger.info(
+                    "Bootstrapped SQLite from %s: %d run(s) imported",
+                    RUNS_JSONL_PATH,
+                    migrated,
+                )
 
     if MCP_CONFIG_PATH.exists():
         try:
@@ -105,6 +120,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         tool_registry=tool_registry,
         skill_forge=_skill_forge,
         tier_manager=tier_manager,
+        storage=_storage,
     )
 
     try:
@@ -112,9 +128,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         if _mcp_pool is not None:
             await _mcp_pool.close()
+        if _storage is not None:
+            _storage.close()
         _run_manager = None
         _mcp_pool = None
         _skill_forge = None
+        _storage = None
+
+
+def _storage_enabled() -> bool:
+    flag = os.getenv("WANXIANG_STORAGE_DUAL_WRITE", "").strip().lower()
+    return flag in {"1", "true", "yes", "on"}
+
+
+def _should_bootstrap_storage(storage: Storage) -> bool:
+    """Only import runs.jsonl when the SQLite DB has no runs yet.
+
+    Idempotence guard — re-running the server must not duplicate history.
+    """
+    return len(storage.list_runs(limit=1)) == 0
 
 
 def _build_skill_forge(

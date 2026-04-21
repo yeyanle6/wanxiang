@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -12,7 +13,9 @@ from uuid import uuid4
 from wanxiang.core.builtin_tools import create_default_registry
 from wanxiang.core.factory import AgentFactory
 from wanxiang.core.message import Message, MessageStatus
+from wanxiang.core.outcome_tagger import tag_run
 from wanxiang.core.pipeline import WorkflowEngine
+from wanxiang.core.storage import RunRecord, Storage
 from wanxiang.core.tier import TierManager
 
 from .events import RunEvent
@@ -29,6 +32,8 @@ class _RunState:
     completed_at: str = ""
     final_status: str = MessageStatus.ERROR.value
     events: list[dict[str, Any]] = field(default_factory=list)
+    level: int | None = None
+    source: str = "user"
 
 
 class RunManager:
@@ -39,6 +44,7 @@ class RunManager:
         tool_registry: Any = None,
         skill_forge: Any = None,
         tier_manager: TierManager | None = None,
+        storage: Storage | None = None,
     ) -> None:
         if factory is not None:
             self.factory = factory
@@ -54,10 +60,12 @@ class RunManager:
                 skill_forge=skill_forge,
             )
         self.tier_manager = tier_manager if tier_manager is not None else TierManager()
+        self.storage = storage
         self._runs: dict[str, _RunState] = {}
         self._lock = asyncio.Lock()
         self._persist_lock = asyncio.Lock()
         self._history_path = Path(__file__).resolve().parents[2] / "data" / "runs.jsonl"
+        self._logger = logging.getLogger("wanxiang.run_manager")
 
     def has_run(self, run_id: str) -> bool:
         return run_id in self._runs
@@ -98,13 +106,19 @@ class RunManager:
                 return record
         return None
 
-    async def start_run(self, task: str) -> str:
+    async def start_run(
+        self,
+        task: str,
+        *,
+        level: int | None = None,
+        source: str = "user",
+    ) -> str:
         cleaned_task = task.strip()
         if not cleaned_task:
             raise ValueError("Task cannot be empty.")
 
         run_id = str(uuid4())
-        state = _RunState(user_task=cleaned_task)
+        state = _RunState(user_task=cleaned_task, level=level, source=source)
         async with self._lock:
             self._runs[run_id] = state
             state.task = asyncio.create_task(self._execute_run(run_id, cleaned_task))
@@ -392,7 +406,36 @@ class RunManager:
         }
         async with self._persist_lock:
             await asyncio.to_thread(self._append_history_record, record)
+            if self.storage is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._write_storage_record, record, state.level, state.source
+                    )
+                except Exception:
+                    self._logger.exception(
+                        "SQLite dual-write failed for run %s; jsonl write succeeded", run_id
+                    )
         state.persisted = True
+
+    def _write_storage_record(
+        self, record: dict[str, Any], level: int | None, source: str
+    ) -> None:
+        events = record.get("events") if isinstance(record.get("events"), list) else []
+        outcome = tag_run(events, record.get("final_status"))
+        run_record = RunRecord(
+            run_id=str(record["run_id"]),
+            task=str(record.get("task", "")),
+            started_at=str(record.get("started_at", "")),
+            completed_at=str(record.get("completed_at") or "") or None,
+            final_status=str(record.get("final_status") or "") or None,
+            outcome=outcome,
+            level=level,
+            source=source,
+            event_count=len(events),
+            events=events,
+        )
+        self.storage.upsert_run(run_record)
+        self.storage.update_outcome(run_record.run_id, outcome)
 
     def _append_history_record(self, record: dict[str, Any]) -> None:
         self._history_path.parent.mkdir(parents=True, exist_ok=True)
