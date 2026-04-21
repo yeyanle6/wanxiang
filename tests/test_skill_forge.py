@@ -264,10 +264,11 @@ def test_forge_handles_sandbox_timeout_and_feeds_back() -> None:
             _spec_json("loop_tool", _GOOD_HANDLER, _GOOD_TEST),
         ]
     )
-    # Use a tight sandbox timeout for the forge's internal sandbox.
+    # Use a short sandbox timeout so the infinite-loop handler is killed quickly,
+    # but long enough that pytest subprocess startup doesn't cause false timeouts.
     registry = ToolRegistry()
     forge = SkillForge(
-        sandbox=SandboxExecutor(timeout_s=0.5),
+        sandbox=SandboxExecutor(timeout_s=3.0),
         registry=registry,
         synthesizer=synth,
         max_retries=3,
