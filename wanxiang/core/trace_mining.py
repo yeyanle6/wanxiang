@@ -31,28 +31,41 @@ from typing import Any, Iterable
 
 
 # ---------------------------------------------------------------------------
-# Default failure keywords — each string matches substring-wise against the
-# content of ERROR-status messages. Add new ones as new failure modes
-# surface; ordering doesn't matter (we count all hits per keyword).
+# Failure keyword sets — substring-matched against ERROR-status message
+# content. Split into two categories so consumers (esp. Phase 6.4) can
+# react to capability gaps without being confused by infra noise.
 # ---------------------------------------------------------------------------
 
+# Infrastructure / auth / network / quota — engineering-intractable at the
+# agent level. Fixing these requires ops/config changes, not tool synthesis.
+INFRA_FAILURE_KEYWORDS: tuple[str, ...] = (
+    "LLM call exceeded",         # hard-timeout (TPM hold, slow backend)
+    "Exceeded max_retries",      # retry ladder exhausted
+    "Tool timed out",            # tool-level timeout
+    "Claude CLI returned empty", # CLI infra issue
+    "Claude CLI call failed",    # CLI infra issue
+    "Not logged in",             # auth
+    "Native tools require",      # config / auth
+    "ANTHROPIC_API_KEY",         # auth
+    "TimeoutError",              # generic timeout
+    "ConnectionError",           # network
+)
+
+# Capability gaps — the agent tried to do something the current tool set
+# can't handle. These are the primary trigger signal for Phase 6.4 synthesis.
+CAPABILITY_GAP_KEYWORDS: tuple[str, ...] = (
+    "Exceeded max_tool_rounds",      # agent looping, can't finish the task
+    "Unknown tool:",                 # tool missing → synthesis candidate
+    "Invalid arguments:",            # wrong tool usage → may need a better wrapper
+    "sandbox did not pass",          # synthesis attempt failed
+    "handler materialization failed",# synthesis handler broken
+    "JSONDecodeError",               # malformed LLM output (logic issue)
+)
+
+# Combined alias kept for callers that don't need the split
+# (e.g. extra_failure_keywords default path, legacy callers).
 DEFAULT_FAILURE_KEYWORDS: tuple[str, ...] = (
-    "LLM call exceeded",         # hard-timeout firing (TPM hold, slow backend)
-    "Exceeded max_tool_rounds",
-    "Exceeded max_retries",
-    "Tool timed out",
-    "Unknown tool:",
-    "Invalid arguments:",
-    "Claude CLI returned empty",
-    "Claude CLI call failed",
-    "Not logged in",
-    "Native tools require",
-    "sandbox did not pass",
-    "handler materialization failed",
-    "ANTHROPIC_API_KEY",
-    "JSONDecodeError",
-    "TimeoutError",
-    "ConnectionError",
+    INFRA_FAILURE_KEYWORDS + CAPABILITY_GAP_KEYWORDS
 )
 
 
@@ -74,12 +87,14 @@ class FailurePattern:
     keyword: str
     count: int
     example: str  # first matching content snippet, truncated to 200 chars
+    category: str = "unknown"  # "infra" | "capability_gap" | "unknown"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "keyword": self.keyword,
             "count": self.count,
             "example": self.example,
+            "category": self.category,
         }
 
 
@@ -170,7 +185,8 @@ class TraceMiningReport:
     total_runs: int
     final_status_distribution: dict[str, int]
     workflow_mix: dict[str, int]
-    common_failure_patterns: list[FailurePattern]
+    infra_failure_patterns: list[FailurePattern]
+    capability_gap_patterns: list[FailurePattern]
     tool_usage: dict[str, ToolUsageStats]
     tool_usage_by_group: dict[str, int]
     synthesis_stats: SynthesisStats
@@ -185,8 +201,11 @@ class TraceMiningReport:
             "total_runs": self.total_runs,
             "final_status_distribution": dict(self.final_status_distribution),
             "workflow_mix": dict(self.workflow_mix),
-            "common_failure_patterns": [
-                p.to_dict() for p in self.common_failure_patterns
+            "infra_failure_patterns": [
+                p.to_dict() for p in self.infra_failure_patterns
+            ],
+            "capability_gap_patterns": [
+                p.to_dict() for p in self.capability_gap_patterns
             ],
             "tool_usage": {
                 name: stats.to_dict() for name, stats in self.tool_usage.items()
@@ -238,8 +257,10 @@ def mine_traces(
 
     workflow_mix: Counter[str] = Counter()
     agent_naming: Counter[str] = Counter()
-    failure_counter: Counter[str] = Counter()
-    failure_examples: dict[str, str] = {}
+    infra_counter: Counter[str] = Counter()
+    infra_examples: dict[str, str] = {}
+    gap_counter: Counter[str] = Counter()
+    gap_examples: dict[str, str] = {}
     agent_timing_total: dict[str, int] = defaultdict(int)
     agent_timing_calls: dict[str, int] = defaultdict(int)
     tool_call_agg: dict[str, dict[str, int]] = defaultdict(
@@ -255,7 +276,8 @@ def mine_traces(
     review_iterations: list[tuple[int, str]] = []  # (iteration_count, last_reviewer_status)
     review_run_ids: set[str] = set()
 
-    keywords = tuple(DEFAULT_FAILURE_KEYWORDS) + tuple(extra_failure_keywords)
+    infra_keywords = INFRA_FAILURE_KEYWORDS
+    gap_keywords = CAPABILITY_GAP_KEYWORDS + tuple(extra_failure_keywords)
 
     for run in filtered_runs:
         events = run.get("events") or []
@@ -288,11 +310,18 @@ def mine_traces(
                 agent_timing_calls[agent] += 1
 
                 if str(data.get("status", "")).lower() == "error":
+                    content = str(data.get("content", ""))
                     _record_failure_patterns(
-                        text=str(data.get("content", "")),
-                        keywords=keywords,
-                        counter=failure_counter,
-                        examples=failure_examples,
+                        text=content,
+                        keywords=infra_keywords,
+                        counter=infra_counter,
+                        examples=infra_examples,
+                    )
+                    _record_failure_patterns(
+                        text=content,
+                        keywords=gap_keywords,
+                        counter=gap_counter,
+                        examples=gap_examples,
                     )
 
             elif etype == "tool_completed":
@@ -322,11 +351,18 @@ def mine_traces(
                             isinstance(entry, dict)
                             and str(entry.get("status", "")).lower() == "error"
                         ):
+                            content = str(entry.get("content", ""))
                             _record_failure_patterns(
-                                text=str(entry.get("content", "")),
-                                keywords=keywords,
-                                counter=failure_counter,
-                                examples=failure_examples,
+                                text=content,
+                                keywords=infra_keywords,
+                                counter=infra_counter,
+                                examples=infra_examples,
+                            )
+                            _record_failure_patterns(
+                                text=content,
+                                keywords=gap_keywords,
+                                counter=gap_counter,
+                                examples=gap_examples,
                             )
 
         if workflow == "review_loop" and max_iter_in_run > 0:
@@ -356,14 +392,25 @@ def mine_traces(
     for stats in tool_usage.values():
         tool_usage_by_group[stats.group] += stats.calls
 
-    # ---- failure patterns -------------------------------------------------
-    patterns = [
+    # ---- failure patterns (split by category) ----------------------------
+    infra_patterns = [
         FailurePattern(
             keyword=kw,
             count=count,
-            example=failure_examples.get(kw, ""),
+            example=infra_examples.get(kw, ""),
+            category="infra",
         )
-        for kw, count in failure_counter.most_common()
+        for kw, count in infra_counter.most_common()
+    ][:top_failure_patterns]
+
+    gap_patterns = [
+        FailurePattern(
+            keyword=kw,
+            count=count,
+            example=gap_examples.get(kw, ""),
+            category="capability_gap",
+        )
+        for kw, count in gap_counter.most_common()
     ][:top_failure_patterns]
 
     # ---- slowest agents ---------------------------------------------------
@@ -394,7 +441,8 @@ def mine_traces(
         total_runs=len(filtered_runs),
         final_status_distribution=dict(final_status_distribution),
         workflow_mix=dict(workflow_mix),
-        common_failure_patterns=patterns,
+        infra_failure_patterns=infra_patterns,
+        capability_gap_patterns=gap_patterns,
         tool_usage=tool_usage,
         tool_usage_by_group=dict(tool_usage_by_group),
         synthesis_stats=synthesis_stats,

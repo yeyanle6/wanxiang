@@ -63,6 +63,7 @@ class FailurePatternModel(BaseModel):
     keyword: str
     count: int
     example: str
+    category: str = "unknown"
 
 
 class ToolUsageStatsModel(BaseModel):
@@ -113,7 +114,8 @@ class TraceMiningResponse(BaseModel):
     total_runs: int
     final_status_distribution: dict[str, int]
     workflow_mix: dict[str, int]
-    common_failure_patterns: list[FailurePatternModel]
+    infra_failure_patterns: list[FailurePatternModel]
+    capability_gap_patterns: list[FailurePatternModel]
     tool_usage: dict[str, ToolUsageStatsModel]
     tool_usage_by_group: dict[str, int]
     synthesis_stats: SynthesisStatsModel

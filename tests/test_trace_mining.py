@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from wanxiang.core.trace_mining import (
+    CAPABILITY_GAP_KEYWORDS,
     DEFAULT_FAILURE_KEYWORDS,
+    INFRA_FAILURE_KEYWORDS,
     FailurePattern,
     ReviewerStats,
     SynthesisStats,
@@ -83,22 +85,39 @@ def test_window_info_spans_fixture_range(runs):
 # ---------------------------------------------------------------------------
 
 
-def test_common_failure_patterns_picks_up_known_signatures(runs):
+def test_failure_patterns_split_by_category(runs):
     report = mine_traces(runs)
-    keywords_found = {p.keyword for p in report.common_failure_patterns}
-    # Both of these appear literally in the fixture error messages.
-    assert "Exceeded max_tool_rounds" in keywords_found
-    assert "Claude CLI call failed" in keywords_found
-    assert "Not logged in" in keywords_found
 
-    # Patterns are sorted by count descending.
-    counts = [p.count for p in report.common_failure_patterns]
-    assert counts == sorted(counts, reverse=True)
+    infra_kws = {p.keyword for p in report.infra_failure_patterns}
+    gap_kws = {p.keyword for p in report.capability_gap_patterns}
+
+    # Infra keywords appear in infra bucket, not gap.
+    assert "Claude CLI call failed" in infra_kws
+    assert "Not logged in" in infra_kws
+    assert "Claude CLI call failed" not in gap_kws
+
+    # Capability gap keywords appear in gap bucket, not infra.
+    assert "Exceeded max_tool_rounds" in gap_kws
+    assert "Exceeded max_tool_rounds" not in infra_kws
+
+    # Both lists sorted by count descending.
+    infra_counts = [p.count for p in report.infra_failure_patterns]
+    assert infra_counts == sorted(infra_counts, reverse=True)
+    gap_counts = [p.count for p in report.capability_gap_patterns]
+    assert gap_counts == sorted(gap_counts, reverse=True)
+
+
+def test_failure_pattern_category_field(runs):
+    report = mine_traces(runs)
+    for p in report.infra_failure_patterns:
+        assert p.category == "infra"
+    for p in report.capability_gap_patterns:
+        assert p.category == "capability_gap"
 
 
 def test_failure_pattern_carries_example_snippet(runs):
     report = mine_traces(runs)
-    by_kw = {p.keyword: p for p in report.common_failure_patterns}
+    by_kw = {p.keyword: p for p in report.capability_gap_patterns}
     assert "Exceeded max_tool_rounds" in by_kw
     assert "Exceeded max_tool_rounds" in by_kw["Exceeded max_tool_rounds"].example
 
@@ -107,12 +126,13 @@ def test_extra_failure_keywords_are_honored(runs):
     report = mine_traces(runs, extra_failure_keywords=["run_failed"])
     # The `run_failed` intent appears in the CLI-error trace entry, but
     # we only match against `content`, so this keyword should NOT show up.
-    keywords = {p.keyword for p in report.common_failure_patterns}
-    assert "run_failed" not in keywords
+    gap_kws = {p.keyword for p in report.capability_gap_patterns}
+    assert "run_failed" not in gap_kws
 
     report2 = mine_traces(runs, extra_failure_keywords=["claude auth login"])
-    keywords2 = {p.keyword for p in report2.common_failure_patterns}
-    assert "claude auth login" in keywords2
+    # extra_failure_keywords go to capability_gap bucket
+    gap_kws2 = {p.keyword for p in report2.capability_gap_patterns}
+    assert "claude auth login" in gap_kws2
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +386,8 @@ def test_mine_traces_handles_empty_inputs():
     assert report.total_runs == 0
     assert report.final_status_distribution == {}
     assert report.workflow_mix == {}
-    assert report.common_failure_patterns == []
+    assert report.infra_failure_patterns == []
+    assert report.capability_gap_patterns == []
     assert report.tool_usage == {}
     assert report.synthesis_stats.total_requests == 0
     assert report.reviewer_convergence.total_review_runs == 0
@@ -374,6 +395,9 @@ def test_mine_traces_handles_empty_inputs():
 
 
 def test_default_failure_keywords_nonempty():
-    # Defensive check — if someone wipes the list we want a red test.
-    assert len(DEFAULT_FAILURE_KEYWORDS) >= 5
-    assert "Exceeded max_tool_rounds" in DEFAULT_FAILURE_KEYWORDS
+    # Defensive check — if someone wipes the lists we want a red test.
+    assert len(INFRA_FAILURE_KEYWORDS) >= 5
+    assert len(CAPABILITY_GAP_KEYWORDS) >= 3
+    assert len(DEFAULT_FAILURE_KEYWORDS) == len(INFRA_FAILURE_KEYWORDS) + len(CAPABILITY_GAP_KEYWORDS)
+    assert "Exceeded max_tool_rounds" in CAPABILITY_GAP_KEYWORDS
+    assert "Not logged in" in INFRA_FAILURE_KEYWORDS
