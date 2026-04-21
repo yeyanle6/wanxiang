@@ -26,9 +26,13 @@ env/
 node_modules/
 npm-debug.log*
 
-# Runtime data (LLM outputs, run traces)
+# Runtime data (LLM outputs, run traces, SQLite DB, generated skills)
 data/runs.jsonl
+data/wanxiang.db
+data/wanxiang.db-wal
+data/wanxiang.db-shm
 data/*.log
+skills/
 
 # Local MCP configuration (keep .example in git, ignore the real one)
 configs/mcp.yaml
