@@ -342,3 +342,77 @@ def test_max_retries_must_be_positive() -> None:
             synthesizer=ScriptedSynthesizer([]),
             max_retries=0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Skill persistence (skills_dir)
+# ---------------------------------------------------------------------------
+
+
+def _make_forge_with_dir(synthesizer, tmp_path, *, max_retries: int = 3):
+    registry = ToolRegistry()
+    sandbox = SandboxExecutor(timeout_s=15.0)
+    forge = SkillForge(
+        sandbox=sandbox,
+        registry=registry,
+        synthesizer=synthesizer,
+        max_retries=max_retries,
+        skills_dir=tmp_path,
+    )
+    return forge, registry
+
+
+def test_persist_writes_json_on_success(tmp_path) -> None:
+    synth = ScriptedSynthesizer([_spec_json("echo_tool", _GOOD_HANDLER, _GOOD_TEST)])
+    forge, _ = _make_forge_with_dir(synth, tmp_path)
+
+    result = asyncio.run(forge.forge("echo"))
+
+    assert result.success is True
+    json_path = tmp_path / "echo_tool.json"
+    assert json_path.exists()
+
+
+def test_persist_json_has_expected_fields(tmp_path) -> None:
+    synth = ScriptedSynthesizer([_spec_json("echo_tool", _GOOD_HANDLER, _GOOD_TEST)])
+    forge, _ = _make_forge_with_dir(synth, tmp_path)
+    asyncio.run(forge.forge("echo"))
+
+    import json as _json
+    data = _json.loads((tmp_path / "echo_tool.json").read_text(encoding="utf-8"))
+    assert data["tool_name"] == "echo_tool"
+    assert "description" in data
+    assert "input_schema" in data
+    assert "handler_code" in data
+    assert data["approved"] is False
+    assert data["tier_level"] == 0
+    assert "created_at" in data
+
+
+def test_persist_writes_py_file(tmp_path) -> None:
+    synth = ScriptedSynthesizer([_spec_json("echo_tool", _GOOD_HANDLER, _GOOD_TEST)])
+    forge, _ = _make_forge_with_dir(synth, tmp_path)
+    asyncio.run(forge.forge("echo"))
+
+    py_path = tmp_path / "echo_tool.py"
+    assert py_path.exists()
+    content = py_path.read_text(encoding="utf-8")
+    assert "def handler" in content
+
+
+def test_persist_not_called_on_failure(tmp_path) -> None:
+    synth = ScriptedSynthesizer([_spec_json("bad_tool", _BAD_HANDLER, _GOOD_TEST)])
+    forge, _ = _make_forge_with_dir(synth, tmp_path, max_retries=1)
+    result = asyncio.run(forge.forge("fail"))
+
+    assert result.success is False
+    assert not any(tmp_path.glob("*.json"))
+
+
+def test_no_skills_dir_does_not_crash(tmp_path) -> None:
+    synth = ScriptedSynthesizer([_spec_json("echo_tool", _GOOD_HANDLER, _GOOD_TEST)])
+    forge, _ = _make_forge(synth)  # no skills_dir
+    result = asyncio.run(forge.forge("echo"))
+
+    assert result.success is True
+    assert forge.skills_dir is None

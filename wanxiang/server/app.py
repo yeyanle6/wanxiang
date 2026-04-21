@@ -4,7 +4,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +18,7 @@ from ..core.gap_detector import detect_synthesis_candidates
 from ..core.mcp_loader import MCPPool, load_mcp_declarations
 from ..core.sandbox import SandboxExecutor
 from ..core.skill_forge import SkillForge
+from ..core.skill_loader import approve_skill, list_skills, load_approved_skills
 from ..core.tier import TierManager
 from ..core.trace_mining import mine_traces
 from .mcp_status import probe_mcp_status
@@ -30,6 +31,9 @@ from .models import (
     RunListResponse,
     RunRequest,
     RunResponse,
+    SkillApproveResponse,
+    SkillListResponse,
+    SkillRecordModel,
     TierSummaryResponse,
     TraceMiningResponse,
 )
@@ -43,6 +47,7 @@ MCP_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "mcp.yaml"
 SKILL_SYNTHESIZER_YAML = (
     Path(__file__).resolve().parents[2] / "configs" / "agents" / "skill_synthesizer.yaml"
 )
+SKILLS_DIR = Path(__file__).resolve().parents[2] / "skills"
 
 _run_manager: RunManager | None = None
 _mcp_pool: MCPPool | None = None
@@ -82,8 +87,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     llm_mode = os.getenv("WANXIANG_LLM_MODE")
     tier_manager = TierManager()
+
+    SKILLS_DIR.mkdir(exist_ok=True)
+    loaded = load_approved_skills(SKILLS_DIR, tool_registry, tier_manager)
+    if loaded:
+        logger.info("Loaded %d approved skill(s) from %s", loaded, SKILLS_DIR)
+
     _skill_forge = _build_skill_forge(
-        tool_registry=tool_registry, llm_mode=llm_mode, tier_manager=tier_manager
+        tool_registry=tool_registry,
+        llm_mode=llm_mode,
+        tier_manager=tier_manager,
+        skills_dir=SKILLS_DIR,
     )
 
     _run_manager = RunManager(
@@ -104,7 +118,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 def _build_skill_forge(
-    *, tool_registry, llm_mode: str | None, tier_manager: TierManager | None = None
+    *,
+    tool_registry,
+    llm_mode: str | None,
+    tier_manager: TierManager | None = None,
+    skills_dir: Path | None = None,
 ) -> SkillForge | None:
     """Wire up SynthesizerAgent + SandboxExecutor + SkillForge.
 
@@ -148,6 +166,7 @@ def _build_skill_forge(
         synthesizer=synthesizer,
         max_retries=int(os.getenv("WANXIANG_SKILL_FORGE_RETRIES", "3")),
         tier_manager=tier_manager,
+        skills_dir=skills_dir,
     )
     logger.info("SkillForge ready: synthesizer=%s", synth_config.name)
     return forge
@@ -366,6 +385,63 @@ async def trigger_forge(request: ForgeTriggerRequest) -> ForgeTriggerResponse:
         registered=result.registered,
         attempts=len(result.attempts),
         error=result.error,
+    )
+
+
+@app.get("/api/skills", response_model=SkillListResponse)
+async def list_skills_endpoint() -> SkillListResponse:
+    """List all synthesized skills — both pending (approved=false) and approved."""
+    records = list_skills(SKILLS_DIR)
+    return SkillListResponse(
+        skills=[SkillRecordModel(**r.to_dict()) for r in records],
+        total=len(records),
+    )
+
+
+@app.post("/api/skills/{tool_name}/approve", response_model=SkillApproveResponse)
+async def approve_skill_endpoint(tool_name: str) -> SkillApproveResponse:
+    """Flip approved=true and register the skill into the live registry."""
+    record = approve_skill(SKILLS_DIR, tool_name)
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Skill '{tool_name}' not found in {SKILLS_DIR}",
+        )
+
+    rm = _get_run_manager()
+    registry = getattr(rm.factory, "tool_registry", None)
+    already_registered = registry is not None and registry.get(tool_name) is not None
+    registered_now = False
+
+    if not already_registered and registry is not None:
+        try:
+            namespace: dict[str, Any] = {}
+            exec(record.handler_code, namespace)  # noqa: S102
+            handler_fn = namespace.get("handler") or namespace.get(tool_name)
+            if callable(handler_fn):
+                from ..core.tools import ToolSpec
+                tool_spec = ToolSpec(
+                    name=record.tool_name,
+                    description=record.description,
+                    input_schema=record.input_schema,
+                    handler=handler_fn,
+                    group="synthesized",
+                )
+                registry.register(tool_spec)
+                rm.tier_manager.initialize_tool(tool_name, record.tier_level)
+                registered_now = True
+                logger.info("Approved and registered skill '%s'", tool_name)
+        except Exception:
+            logger.exception("Failed to register skill '%s' after approval", tool_name)
+
+    return SkillApproveResponse(
+        tool_name=tool_name,
+        approved=True,
+        registered=already_registered or registered_now,
+        message=(
+            "Already registered." if already_registered
+            else ("Registered." if registered_now else "Approved; registration failed — check logs.")
+        ),
     )
 
 

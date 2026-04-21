@@ -169,3 +169,24 @@ class TierSummaryResponse(BaseModel):
     by_level: dict[str, int]
     recent_changes: list[dict[str, Any]]
     tools: dict[str, TierToolModel]
+
+
+class SkillRecordModel(BaseModel):
+    tool_name: str
+    description: str
+    input_schema: dict[str, Any]
+    approved: bool
+    tier_level: int
+    created_at: str
+
+
+class SkillListResponse(BaseModel):
+    skills: list[SkillRecordModel]
+    total: int
+
+
+class SkillApproveResponse(BaseModel):
+    tool_name: str
+    approved: bool
+    registered: bool
+    message: str
