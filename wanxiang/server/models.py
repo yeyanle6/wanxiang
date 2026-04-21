@@ -125,6 +125,31 @@ class TraceMiningResponse(BaseModel):
     tier_changes: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class SynthesisCandidateModel(BaseModel):
+    tool_name: str
+    failure_count: int
+    sample_arguments: list[dict[str, Any]]
+    suggested_requirement: str
+
+
+class ForgeCandidatesResponse(BaseModel):
+    candidates: list[SynthesisCandidateModel]
+    forge_ready: bool
+
+
+class ForgeTriggerRequest(BaseModel):
+    tool_name: str = Field(..., min_length=1)
+    requirement: str | None = Field(default=None)
+
+
+class ForgeTriggerResponse(BaseModel):
+    tool_name: str
+    success: bool
+    registered: bool
+    attempts: int
+    error: str | None = None
+
+
 class TierToolModel(BaseModel):
     tool_name: str
     level: int

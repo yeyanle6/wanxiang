@@ -14,6 +14,7 @@ from datetime import datetime
 
 from ..core.agent import AgentConfig, BaseAgent
 from ..core.builtin_tools import create_default_registry
+from ..core.gap_detector import detect_synthesis_candidates
 from ..core.mcp_loader import MCPPool, load_mcp_declarations
 from ..core.sandbox import SandboxExecutor
 from ..core.skill_forge import SkillForge
@@ -21,6 +22,9 @@ from ..core.tier import TierManager
 from ..core.trace_mining import mine_traces
 from .mcp_status import probe_mcp_status
 from .models import (
+    ForgeCandidatesResponse,
+    ForgeTriggerRequest,
+    ForgeTriggerResponse,
     MCPStatusResponse,
     RunDetailResponse,
     RunListResponse,
@@ -284,6 +288,85 @@ async def get_tier_summary() -> TierSummaryResponse:
     rm = _get_run_manager()
     summary = rm.tier_manager.get_tier_summary()
     return TierSummaryResponse(**summary)
+
+
+@app.get("/api/forge/candidates", response_model=ForgeCandidatesResponse)
+async def get_forge_candidates(
+    min_failures: int = Query(default=1, ge=1, description="Minimum failure count to surface a candidate."),
+) -> ForgeCandidatesResponse:
+    """Return synthesis candidates derived from recurring 'Unknown tool:' gaps."""
+    rm = _get_run_manager()
+    runs = await rm.read_raw_history()
+
+    registry = getattr(rm.factory, "tool_registry", None)
+    audit_log = registry.get_audit_log() if registry is not None else []
+    tool_groups = registry.get_tool_groups() if registry is not None else {}
+    synthesis_log = list(getattr(rm.factory, "synthesis_log", []) or [])
+    tier_changes = [ch.to_dict() for ch in rm.tier_manager.get_recent_changes()]
+
+    report = mine_traces(
+        runs,
+        audit_log=audit_log,
+        synthesis_log=synthesis_log,
+        tool_groups=tool_groups,
+        tier_changes=tier_changes,
+    )
+    candidates = detect_synthesis_candidates(
+        report.capability_gap_patterns,
+        runs,
+        min_failure_count=min_failures,
+    )
+    return ForgeCandidatesResponse(
+        candidates=[c.to_dict() for c in candidates],
+        forge_ready=_skill_forge is not None,
+    )
+
+
+@app.post("/api/forge/trigger", response_model=ForgeTriggerResponse)
+async def trigger_forge(request: ForgeTriggerRequest) -> ForgeTriggerResponse:
+    """Trigger SkillForge synthesis for a named candidate.
+
+    Requires WANXIANG_ENABLE_SKILL_FORGE=1. The forge runs synchronously —
+    expect several seconds of latency. Returns the result immediately.
+    """
+    if _skill_forge is None:
+        raise HTTPException(
+            status_code=503,
+            detail="SkillForge not enabled. Set WANXIANG_ENABLE_SKILL_FORGE=1.",
+        )
+
+    rm = _get_run_manager()
+    runs = await rm.read_raw_history()
+
+    requirement = (request.requirement or "").strip()
+    if not requirement:
+        registry = getattr(rm.factory, "tool_registry", None)
+        audit_log = registry.get_audit_log() if registry is not None else []
+        tool_groups = registry.get_tool_groups() if registry is not None else {}
+        synthesis_log = list(getattr(rm.factory, "synthesis_log", []) or [])
+        tier_changes = [ch.to_dict() for ch in rm.tier_manager.get_recent_changes()]
+
+        report = mine_traces(
+            runs,
+            audit_log=audit_log,
+            synthesis_log=synthesis_log,
+            tool_groups=tool_groups,
+            tier_changes=tier_changes,
+        )
+        candidates = detect_synthesis_candidates(report.capability_gap_patterns, runs)
+        match = next((c for c in candidates if c.tool_name == request.tool_name), None)
+        requirement = match.suggested_requirement if match else (
+            f"Implement a tool named '{request.tool_name}'."
+        )
+
+    result = await _skill_forge.forge(requirement)
+    return ForgeTriggerResponse(
+        tool_name=request.tool_name,
+        success=result.success,
+        registered=result.registered,
+        attempts=len(result.attempts),
+        error=result.error,
+    )
 
 
 @app.get("/api/trace/mining", response_model=TraceMiningResponse)
