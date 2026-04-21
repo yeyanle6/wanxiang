@@ -75,24 +75,44 @@ def _iter_error_strings(events: Iterable[dict[str, Any]]) -> Iterable[str]:
         if not isinstance(data, dict):
             continue
 
-        # Direct error fields on any event.
+        # Direct error field on any event.
         err = data.get("error")
         if isinstance(err, str) and err.strip():
             yield err
 
-        # tool_completed carries success=False + error in content.
+        # tool_completed with success=False → error text is in content.
         if etype == "tool_completed" and data.get("success") is False:
-            content = data.get("content") or data.get("error") or ""
+            content = data.get("content") or data.get("content_preview") or ""
             if isinstance(content, str) and content.strip():
                 yield content
 
-        # agent_completed / run_completed may carry error strings in message/status.
-        if etype in ("agent_completed", "run_completed"):
-            status = str(data.get("status", ""))
-            if status.lower() == "error":
-                msg = data.get("message") or data.get("error") or ""
-                if isinstance(msg, str) and msg.strip():
-                    yield msg
+        # agent_completed with status=error → error text is top-level content.
+        if etype == "agent_completed" and str(data.get("status", "")).lower() == "error":
+            content = data.get("content") or data.get("content_preview") or ""
+            if isinstance(content, str) and content.strip():
+                yield content
+
+        # run_completed carries a trace array; the actual error message
+        # lives in trace[].content where trace[].status == "error".
+        # final_status of 'error' without this traversal would land as unknown.
+        if etype == "run_completed" and str(data.get("final_status", "")).lower() == "error":
+            for entry in data.get("trace") or []:
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("status", "")).lower() != "error":
+                    continue
+                content = entry.get("content")
+                if isinstance(content, str) and content.strip():
+                    yield content
+
+        # run_started on an init-failed run carries the failure hint in
+        # plan.rationale (e.g., "run initialization failed: RuntimeError").
+        if etype == "run_started":
+            plan = data.get("plan")
+            if isinstance(plan, dict):
+                rationale = plan.get("rationale")
+                if isinstance(rationale, str) and "fail" in rationale.lower():
+                    yield rationale
 
 
 def _matches_any(haystacks: list[str], needles: tuple[str, ...]) -> bool:

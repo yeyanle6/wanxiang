@@ -30,7 +30,7 @@ class TestInfraError:
         events = [
             {
                 "type": "agent_completed",
-                "data": {"status": "error", "message": "ANTHROPIC_API_KEY not configured"},
+                "data": {"status": "error", "content": "ANTHROPIC_API_KEY not configured"},
             }
         ]
         assert tag_run(events, "error") == OUTCOME_INFRA_ERROR
@@ -59,7 +59,7 @@ class TestCapabilityGap:
         assert tag_run(events, "error") == OUTCOME_CAPABILITY_GAP
 
     def test_max_tool_rounds_exceeded(self):
-        events = [{"type": "agent_completed", "data": {"status": "error", "message": "Exceeded max_tool_rounds=15"}}]
+        events = [{"type": "agent_completed", "data": {"status": "error", "content": "Exceeded max_tool_rounds=15"}}]
         assert tag_run(events, "error") == OUTCOME_CAPABILITY_GAP
 
 
@@ -110,6 +110,67 @@ class TestUnknown:
     def test_malformed_events_do_not_crash(self):
         events = [None, "not-a-dict", {"type": "x"}, {"type": "y", "data": "not-a-dict"}]  # type: ignore
         assert tag_run(events, "success") == OUTCOME_SUCCESS
+
+
+class TestNestedErrorExtraction:
+    """Errors live in nested structures (trace[], plan.rationale) that
+    the naive data.error/data.message extractor used to miss."""
+
+    def test_run_completed_trace_content_reached(self):
+        # This is the shape that was landing as 'unknown' in the real DB:
+        # run_completed.final_status='error' with the actual error text in
+        # trace[0].content.
+        events = [
+            {
+                "type": "run_completed",
+                "data": {
+                    "final_status": "error",
+                    "trace": [
+                        {
+                            "intent": "run_failed",
+                            "content": "LLM call exceeded 120s timeout after 3 retries",
+                            "status": "error",
+                        }
+                    ],
+                },
+            }
+        ]
+        assert tag_run(events, "error") == OUTCOME_TIMEOUT
+
+    def test_run_started_plan_rationale_reached(self):
+        events = [
+            {
+                "type": "run_started",
+                "data": {
+                    "plan": {
+                        "workflow": "pipeline",
+                        "rationale": "run initialization failed: RuntimeError",
+                        "agents": [],
+                    }
+                },
+            }
+        ]
+        # "RuntimeError" is not in any keyword list, so no specific bucket
+        # matches — but "failed" in rationale at least produces a non-empty
+        # error_strings list, so with final_status=error we fall through.
+        # The point of this test is that _iter_error_strings DOES yield
+        # the rationale string.
+        from wanxiang.core.outcome_tagger import _iter_error_strings
+        strings = list(_iter_error_strings(events))
+        assert any("initialization failed" in s for s in strings)
+
+    def test_agent_completed_with_error_status(self):
+        events = [
+            {
+                "type": "agent_completed",
+                "data": {
+                    "agent": "writer",
+                    "status": "error",
+                    "content": "Unknown tool: magic_search — not in registry",
+                },
+            }
+        ]
+        assert tag_run(events, "error") == OUTCOME_CAPABILITY_GAP
 
 
 class TestDecisionOrder:
