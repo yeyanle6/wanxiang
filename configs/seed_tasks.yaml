@@ -1,0 +1,226 @@
+# Wanxiang 种子任务库（中文）
+#
+# 作用：系统启动时的"引导训练集"。autoschool 在没有课程生成能力之前，
+# 先消费这些任务来积累基础运行数据、工具行为样本和失败模式。
+#
+# 字段说明：
+#   id:                         唯一标识
+#   level:                      0 / 1 / 2，对应感知期 / 操作期 / 组合期
+#   task:                       任务正文，投给 Director
+#   expected_outcome_keywords:  离线验证用——完成后检查输出文本中是否包含这些关键词
+#                               （不是硬校验，只是给 outcome_tagger 的补充信号）
+#   tags:                       分类标签，用于后续分析
+#
+# 设计原则：
+#   - L0 任务：验证系统自我认知（列工具、说明自己能做什么）
+#   - L1 任务：单步原子能力，输出形式稳定（字符串处理、简单计算、格式转换）
+#   - L2 任务：2-3 步组合，需要 pipeline 或 review_loop
+#
+# 起步量：30 条（10 + 15 + 5）。后续由 curriculum.py 自动生成扩展。
+
+seed_tasks:
+
+  # ---------- L0：感知期（10 条） ----------
+  # 目标：系统认识自己有哪些工具、哪些能力，不涉及外部信息。
+
+  - id: l0_01
+    level: 0
+    task: "列出你当前可以使用的所有工具，并对每个工具用一句话说明它的用途。"
+    expected_outcome_keywords: ["工具", "用途"]
+    tags: [self_awareness, tool_inventory]
+
+  - id: l0_02
+    level: 0
+    task: "说明你作为一个多智能体系统的基本工作流程。"
+    expected_outcome_keywords: ["agent", "workflow"]
+    tags: [self_awareness, architecture]
+
+  - id: l0_03
+    level: 0
+    task: "如果用户让你写一篇文章，你通常会组建什么样的团队？每个角色负责什么？"
+    expected_outcome_keywords: ["writer", "reviewer"]
+    tags: [self_awareness, team_pattern]
+
+  - id: l0_04
+    level: 0
+    task: "列出三种你支持的 workflow（pipeline / parallel / review_loop），并分别说明使用场景。"
+    expected_outcome_keywords: ["pipeline", "parallel", "review_loop"]
+    tags: [self_awareness, workflow]
+
+  - id: l0_05
+    level: 0
+    task: "解释一下什么是'工具合成'(skill forge),以及它的典型触发条件。"
+    expected_outcome_keywords: ["合成", "工具"]
+    tags: [self_awareness, forge]
+
+  - id: l0_06
+    level: 0
+    task: "用一段话说明你的 tier 信任系统：工具是如何升降级的？"
+    expected_outcome_keywords: ["tier", "等级"]
+    tags: [self_awareness, tier]
+
+  - id: l0_07
+    level: 0
+    task: "描述 gap detector 的工作方式：它读什么信号、输出什么候选？"
+    expected_outcome_keywords: ["gap", "候选"]
+    tags: [self_awareness, gap_detector]
+
+  - id: l0_08
+    level: 0
+    task: "列出你目前持久化存储的数据类型（如 run 日志、skill 文件、tier 状态）。"
+    expected_outcome_keywords: ["runs", "skill"]
+    tags: [self_awareness, persistence]
+
+  - id: l0_09
+    level: 0
+    task: "解释你遇到失败时的分类方式（infra_error / capability_gap 等）。"
+    expected_outcome_keywords: ["infra", "gap"]
+    tags: [self_awareness, failure_taxonomy]
+
+  - id: l0_10
+    level: 0
+    task: "用一段话解释你的 MCP 工具集成机制。"
+    expected_outcome_keywords: ["MCP"]
+    tags: [self_awareness, mcp]
+
+  # ---------- L1：操作期（15 条） ----------
+  # 目标：单步原子能力。输出形式稳定，可用于验证合成工具质量。
+
+  - id: l1_01
+    level: 1
+    task: "把字符串 'Hello World' 反转后输出。"
+    expected_outcome_keywords: ["dlroW olleH"]
+    tags: [string_ops]
+
+  - id: l1_02
+    level: 1
+    task: "计算 2026-04-21 距离 2026-12-31 还有多少天。"
+    expected_outcome_keywords: ["254", "天"]
+    tags: [date_math]
+
+  - id: l1_03
+    level: 1
+    task: "把 JSON 字符串 '{\"name\": \"alice\", \"age\": 30}' 中 age 字段的值提取出来。"
+    expected_outcome_keywords: ["30"]
+    tags: [json_parse]
+
+  - id: l1_04
+    level: 1
+    task: "把数字列表 [3, 1, 4, 1, 5, 9, 2, 6] 按升序排列后输出。"
+    expected_outcome_keywords: ["1", "2", "3", "4", "5", "6", "9"]
+    tags: [sorting]
+
+  - id: l1_05
+    level: 1
+    task: "把 CSV 片段 'a,b,c\\n1,2,3\\n4,5,6' 解析为二维数组并输出。"
+    expected_outcome_keywords: ["a", "b", "c", "1", "2", "3"]
+    tags: [csv_parse]
+
+  - id: l1_06
+    level: 1
+    task: "把文本 'hello, this is a test. hello again.' 中出现 'hello' 的次数统计出来。"
+    expected_outcome_keywords: ["2"]
+    tags: [text_count]
+
+  - id: l1_07
+    level: 1
+    task: "把摄氏度 100 转换为华氏度,并给出计算公式。"
+    expected_outcome_keywords: ["212", "华氏"]
+    tags: [unit_conversion]
+
+  - id: l1_08
+    level: 1
+    task: "判断 'racecar' 是否是回文,并给出判断依据。"
+    expected_outcome_keywords: ["回文", "是"]
+    tags: [string_ops]
+
+  - id: l1_09
+    level: 1
+    task: "把字符串 'the quick brown fox' 转换成 Title Case(每个单词首字母大写)。"
+    expected_outcome_keywords: ["The Quick Brown Fox"]
+    tags: [string_ops]
+
+  - id: l1_10
+    level: 1
+    task: "计算 1 到 100 所有整数的和,并给出计算过程。"
+    expected_outcome_keywords: ["5050"]
+    tags: [arithmetic]
+
+  - id: l1_11
+    level: 1
+    task: "把十六进制字符串 'ff' 转换成十进制数字。"
+    expected_outcome_keywords: ["255"]
+    tags: [base_conversion]
+
+  - id: l1_12
+    level: 1
+    task: "从 email 地址 'alice@example.com' 中提取用户名和域名两部分。"
+    expected_outcome_keywords: ["alice", "example.com"]
+    tags: [regex, email]
+
+  - id: l1_13
+    level: 1
+    task: "把 ISO 8601 时间戳 '2026-04-21T15:30:00+08:00' 转换成 UTC 时间。"
+    expected_outcome_keywords: ["07:30", "UTC"]
+    tags: [datetime]
+
+  - id: l1_14
+    level: 1
+    task: "计算字符串 'multi-agent orchestration' 的长度(不含空格)。"
+    expected_outcome_keywords: ["24"]
+    tags: [string_ops]
+
+  - id: l1_15
+    level: 1
+    task: "把列表 [1, 2, 2, 3, 3, 3, 4] 去重后输出。"
+    expected_outcome_keywords: ["1", "2", "3", "4"]
+    tags: [list_ops]
+
+  # ---------- L2：组合期（5 条） ----------
+  # 目标：2-3 步组合,强制 pipeline 或 review_loop 形态。
+
+  - id: l2_01
+    level: 2
+    task: |
+      根据以下数据计算季度 ROI:
+      - Q1 收入 120 万,成本 80 万
+      - Q2 收入 150 万,成本 90 万
+      给出每个季度的 ROI 百分比,并指出哪个季度更好。
+    expected_outcome_keywords: ["50%", "66", "Q2"]
+    tags: [multi_step, arithmetic, analysis]
+
+  - id: l2_02
+    level: 2
+    task: |
+      写一段关于"多智能体架构的三个核心优势"的 150 字短文,
+      然后由 reviewer 给出改进建议,再修订一次。
+    expected_outcome_keywords: ["智能体", "优势"]
+    tags: [multi_step, review_loop, content]
+
+  - id: l2_03
+    level: 2
+    task: |
+      给定日志片段:"ERROR 2026-04-21 10:15:22 db connection failed\\n
+      WARN 2026-04-21 10:15:23 retry attempt 1\\n
+      ERROR 2026-04-21 10:15:25 db connection failed"
+      1. 统计 ERROR 与 WARN 的数量
+      2. 提取所有错误发生的时间戳
+      3. 给出一句话诊断。
+    expected_outcome_keywords: ["ERROR", "WARN", "db", "connection"]
+    tags: [multi_step, log_analysis]
+
+  - id: l2_04
+    level: 2
+    task: |
+      对比"monolith 架构"与"microservices 架构"在三个维度上的差异:
+      开发速度、运维复杂度、可扩展性。用表格形式输出,然后给出一段总结。
+    expected_outcome_keywords: ["monolith", "microservices", "扩展"]
+    tags: [multi_step, comparison]
+
+  - id: l2_05
+    level: 2
+    task: |
+      把下面的任务拆解为 3-5 个子步骤,并为每个步骤指定一个负责 agent:
+      "写一份关于 2026 年 AI agent 框架的技术选型报告,需要引用至少 3 个框架做对比。"
+    expected_outcome_keywords: ["步骤", "agent"]
+    tags: [multi_step, planning]
