@@ -13,6 +13,7 @@ from wanxiang.core.builtin_tools import create_default_registry
 from wanxiang.core.factory import AgentFactory
 from wanxiang.core.message import Message, MessageStatus
 from wanxiang.core.pipeline import WorkflowEngine
+from wanxiang.core.tier import TierManager
 
 from .events import RunEvent
 
@@ -37,6 +38,7 @@ class RunManager:
         llm_mode: str | None = None,
         tool_registry: Any = None,
         skill_forge: Any = None,
+        tier_manager: TierManager | None = None,
     ) -> None:
         if factory is not None:
             self.factory = factory
@@ -51,6 +53,7 @@ class RunManager:
                 llm_mode=llm_mode,
                 skill_forge=skill_forge,
             )
+        self.tier_manager = tier_manager if tier_manager is not None else TierManager()
         self._runs: dict[str, _RunState] = {}
         self._lock = asyncio.Lock()
         self._persist_lock = asyncio.Lock()
@@ -286,13 +289,16 @@ class RunManager:
                 return
 
             if event_type == "tool_completed":
+                tool_name = str(event.get("tool", ""))
+                success = bool(event.get("success", False))
+                self.tier_manager.record_result(tool_name, success, run_id)
                 await self._publish(
                     run_id,
                     RunEvent.tool_completed(
                         run_id,
                         agent=str(event.get("agent", "")),
-                        tool=str(event.get("tool", "")),
-                        success=bool(event.get("success", False)),
+                        tool=tool_name,
+                        success=success,
                         elapsed_ms=int(event.get("elapsed_ms", 0)),
                         content_preview=self._preview(str(event.get("content_preview", ""))),
                         turn=self._maybe_int(event.get("turn")),

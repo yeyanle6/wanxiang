@@ -177,6 +177,7 @@ class TraceMiningReport:
     agent_naming: dict[str, int]       # producer (first-in-order) role name counts
     slowest_agents: list[AgentTiming]  # top N by avg_elapsed_ms
     reviewer_convergence: ReviewerStats
+    tier_changes: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -195,6 +196,7 @@ class TraceMiningReport:
             "agent_naming": dict(self.agent_naming),
             "slowest_agents": [a.to_dict() for a in self.slowest_agents],
             "reviewer_convergence": self.reviewer_convergence.to_dict(),
+            "tier_changes": list(self.tier_changes),
         }
 
 
@@ -214,6 +216,7 @@ def mine_traces(
     extra_failure_keywords: Iterable[str] = (),
     slowest_agents_top_n: int = 5,
     top_failure_patterns: int = 10,
+    tier_changes: list[dict[str, Any]] | None = None,
 ) -> TraceMiningReport:
     """Aggregate run + audit + synthesis data into a `TraceMiningReport`.
 
@@ -398,6 +401,7 @@ def mine_traces(
         agent_naming=dict(agent_naming),
         slowest_agents=slowest,
         reviewer_convergence=reviewer,
+        tier_changes=list(tier_changes) if tier_changes else [],
     )
 
 

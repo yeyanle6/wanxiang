@@ -61,11 +61,14 @@ class _FakeRunManager:
         groups: dict[str, str],
         synthesis_log: list[dict],
     ) -> None:
+        from wanxiang.core.tier import TierManager
+
         self._runs = runs
         self.factory = _FakeFactory(
             tool_registry=_FakeRegistry(audit, groups),
             synthesis_log=synthesis_log,
         )
+        self.tier_manager = TierManager()
 
     async def read_raw_history(self) -> list[dict]:
         return list(self._runs)

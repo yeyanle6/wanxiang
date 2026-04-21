@@ -120,3 +120,25 @@ class TraceMiningResponse(BaseModel):
     agent_naming: dict[str, int]
     slowest_agents: list[AgentTimingModel]
     reviewer_convergence: ReviewerStatsModel
+    tier_changes: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class TierToolModel(BaseModel):
+    tool_name: str
+    level: int
+    total_calls: int
+    window_size: int
+    recent_failures: int
+    recent_successes: int
+    window_success_rate: float
+    distinct_runs: int
+    successful_runs: int
+    last_updated: str
+    tier_history: list[dict[str, Any]]
+
+
+class TierSummaryResponse(BaseModel):
+    total_tools_tracked: int
+    by_level: dict[str, int]
+    recent_changes: list[dict[str, Any]]
+    tools: dict[str, TierToolModel]

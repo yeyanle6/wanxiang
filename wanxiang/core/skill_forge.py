@@ -26,6 +26,7 @@ from typing import Any
 from .agent import BaseAgent
 from .message import Message, MessageStatus
 from .sandbox import SandboxExecutor, SandboxResult
+from .tier import TierManager
 from .tools import ToolRegistry, ToolSpec
 
 
@@ -188,6 +189,7 @@ class SkillForge:
         registry: ToolRegistry,
         synthesizer: BaseAgent,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        tier_manager: TierManager | None = None,
     ) -> None:
         if max_retries < 1:
             raise ValueError("max_retries must be >= 1")
@@ -195,6 +197,7 @@ class SkillForge:
         self.registry = registry
         self.synthesizer = synthesizer
         self.max_retries = max_retries
+        self.tier_manager = tier_manager
         self.logger = logging.getLogger("wanxiang.skill_forge")
 
     async def forge(self, requirement: str) -> ForgeResult:
@@ -319,6 +322,9 @@ class SkillForge:
                     f"Registration rejected the spec: {exc}. Adjust and regenerate."
                 )
                 continue
+
+            if self.tier_manager is not None:
+                self.tier_manager.initialize_tool(tool_spec.name, 0)
 
             result.attempts.append(attempt)
             result.tool_spec = tool_spec

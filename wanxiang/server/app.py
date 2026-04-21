@@ -17,6 +17,7 @@ from ..core.builtin_tools import create_default_registry
 from ..core.mcp_loader import MCPPool, load_mcp_declarations
 from ..core.sandbox import SandboxExecutor
 from ..core.skill_forge import SkillForge
+from ..core.tier import TierManager
 from ..core.trace_mining import mine_traces
 from .mcp_status import probe_mcp_status
 from .models import (
@@ -25,6 +26,7 @@ from .models import (
     RunListResponse,
     RunRequest,
     RunResponse,
+    TierSummaryResponse,
     TraceMiningResponse,
 )
 from .runner import RunManager
@@ -75,14 +77,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
 
     llm_mode = os.getenv("WANXIANG_LLM_MODE")
+    tier_manager = TierManager()
     _skill_forge = _build_skill_forge(
-        tool_registry=tool_registry, llm_mode=llm_mode
+        tool_registry=tool_registry, llm_mode=llm_mode, tier_manager=tier_manager
     )
 
     _run_manager = RunManager(
         llm_mode=llm_mode,
         tool_registry=tool_registry,
         skill_forge=_skill_forge,
+        tier_manager=tier_manager,
     )
 
     try:
@@ -96,7 +100,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 def _build_skill_forge(
-    *, tool_registry, llm_mode: str | None
+    *, tool_registry, llm_mode: str | None, tier_manager: TierManager | None = None
 ) -> SkillForge | None:
     """Wire up SynthesizerAgent + SandboxExecutor + SkillForge.
 
@@ -139,6 +143,7 @@ def _build_skill_forge(
         registry=tool_registry,
         synthesizer=synthesizer,
         max_retries=int(os.getenv("WANXIANG_SKILL_FORGE_RETRIES", "3")),
+        tier_manager=tier_manager,
     )
     logger.info("SkillForge ready: synthesizer=%s", synth_config.name)
     return forge
@@ -273,6 +278,14 @@ async def get_tool_audit_log(
     }
 
 
+@app.get("/api/tier", response_model=TierSummaryResponse)
+async def get_tier_summary() -> TierSummaryResponse:
+    """Return the current TierManager snapshot — per-tool trust levels and recent changes."""
+    rm = _get_run_manager()
+    summary = rm.tier_manager.get_tier_summary()
+    return TierSummaryResponse(**summary)
+
+
 @app.get("/api/trace/mining", response_model=TraceMiningResponse)
 async def get_trace_mining(
     after: str | None = Query(default=None, description="ISO-8601 lower bound."),
@@ -297,6 +310,7 @@ async def get_trace_mining(
 
     synthesis_log = list(getattr(rm.factory, "synthesis_log", []) or [])
 
+    tier_changes = rm.tier_manager.get_recent_changes()
     report = mine_traces(
         runs,
         audit_log=audit_log,
@@ -304,6 +318,7 @@ async def get_trace_mining(
         tool_groups=tool_groups,
         after=after_dt,
         before=before_dt,
+        tier_changes=[ch.to_dict() for ch in tier_changes],
     )
     return TraceMiningResponse(**report.to_dict())
 
