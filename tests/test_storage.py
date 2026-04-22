@@ -51,7 +51,50 @@ class TestSchema:
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
         assert row is not None
-        assert row["value"] == "1"
+        assert row["value"] == "2"
+
+    def test_schema1_db_migrates_to_schema2(self, tmp_path):
+        # Simulate a DB created at schema 1 (no grade columns), then reopen
+        # with the current code and verify the columns are added + data
+        # preserved.
+        import sqlite3 as sq
+
+        db_path = tmp_path / "legacy.db"
+        c = sq.connect(db_path)
+        c.execute(
+            """CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY, task TEXT NOT NULL,
+                started_at TEXT NOT NULL, completed_at TEXT,
+                final_status TEXT, outcome TEXT, level INTEGER,
+                source TEXT NOT NULL DEFAULT 'user',
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                event_count INTEGER NOT NULL DEFAULT 0,
+                tagged_at TEXT
+            )"""
+        )
+        c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        c.execute("INSERT INTO meta VALUES ('schema_version', '1')")
+        c.execute(
+            "INSERT INTO runs (run_id, task, started_at, source) VALUES (?, ?, ?, 'user')",
+            ("legacy_run", "legacy task", "2026-04-22T00:00:00+00:00"),
+        )
+        c.commit()
+        c.close()
+
+        # Reopen with current Storage — migration runs.
+        store = Storage(db_path)
+        try:
+            cols = {
+                r["name"]
+                for r in store._conn.execute("PRAGMA table_info(runs)").fetchall()
+            }
+            assert {"graded_pass", "grade_reason", "graded_at"}.issubset(cols)
+            # Legacy row still reachable after migration.
+            got = store.get_run("legacy_run")
+            assert got is not None
+            assert got.graded_pass is None
+        finally:
+            store.close()
 
 
 # ---- Runs ----------------------------------------------------------------

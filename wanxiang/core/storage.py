@@ -29,7 +29,7 @@ from typing import Any, Iterable, Iterator
 
 logger = logging.getLogger("wanxiang.storage")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -48,7 +48,10 @@ CREATE TABLE IF NOT EXISTS runs (
     source        TEXT NOT NULL DEFAULT 'user',
     total_tokens  INTEGER NOT NULL DEFAULT 0,
     event_count   INTEGER NOT NULL DEFAULT 0,
-    tagged_at     TEXT
+    tagged_at     TEXT,
+    graded_pass   INTEGER,
+    grade_reason  TEXT,
+    graded_at     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at);
@@ -116,6 +119,9 @@ class RunRecord:
     total_tokens: int = 0
     event_count: int = 0
     tagged_at: str | None = None
+    graded_pass: bool | None = None
+    grade_reason: str | None = None
+    graded_at: str | None = None
     events: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -131,6 +137,9 @@ class RunRecord:
             "total_tokens": self.total_tokens,
             "event_count": self.event_count,
             "tagged_at": self.tagged_at,
+            "graded_pass": self.graded_pass,
+            "grade_reason": self.grade_reason,
+            "graded_at": self.graded_at,
             "events": list(self.events or []),
         }
 
@@ -163,8 +172,9 @@ class Storage:
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(_SCHEMA_SQL)
+            self._run_migrations()
             self._conn.execute(
-                "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
             now = _utcnow()
@@ -176,6 +186,26 @@ class Storage:
                 """,
                 (now, now),
             )
+
+    def _run_migrations(self) -> None:
+        """ALTER old-schema DBs forward. Callers hold self._lock already."""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        current = int(row["value"]) if row else 0
+
+        if current < 2:
+            # Add grade columns to runs table for Phase 1 grader integration.
+            existing_columns = {
+                r["name"] for r in self._conn.execute("PRAGMA table_info(runs)").fetchall()
+            }
+            for col_sql in (
+                ("graded_pass", "ALTER TABLE runs ADD COLUMN graded_pass INTEGER"),
+                ("grade_reason", "ALTER TABLE runs ADD COLUMN grade_reason TEXT"),
+                ("graded_at", "ALTER TABLE runs ADD COLUMN graded_at TEXT"),
+            ):
+                if col_sql[0] not in existing_columns:
+                    self._conn.execute(col_sql[1])
 
     def close(self) -> None:
         with self._lock:
@@ -291,6 +321,15 @@ class Storage:
             c.execute(
                 "UPDATE runs SET outcome = ?, tagged_at = ? WHERE run_id = ?",
                 (outcome, _utcnow(), run_id),
+            )
+
+    def update_grade(self, run_id: str, *, passed: bool, reason: str = "") -> None:
+        """Record a grader verdict. Writes graded_pass / grade_reason / graded_at."""
+        with self._tx() as c:
+            c.execute(
+                "UPDATE runs SET graded_pass = ?, grade_reason = ?, graded_at = ? "
+                "WHERE run_id = ?",
+                (1 if passed else 0, reason, _utcnow(), run_id),
             )
 
     def search_events(
@@ -526,6 +565,7 @@ def _utcnow() -> str:
 
 
 def _row_to_run(row: sqlite3.Row) -> RunRecord:
+    graded = row["graded_pass"]
     return RunRecord(
         run_id=row["run_id"],
         task=row["task"],
@@ -538,4 +578,7 @@ def _row_to_run(row: sqlite3.Row) -> RunRecord:
         total_tokens=row["total_tokens"] or 0,
         event_count=row["event_count"] or 0,
         tagged_at=row["tagged_at"],
+        graded_pass=None if graded is None else bool(graded),
+        grade_reason=row["grade_reason"],
+        graded_at=row["graded_at"],
     )
