@@ -114,6 +114,7 @@ class BaseAgent:
         tool_registry: ToolRegistry | None = None,
         on_tool_event: ToolEventCallback | None = None,
         llm_mode: str | None = None,
+        usage_recorder: Any = None,
     ) -> None:
         self.config = config
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
@@ -125,6 +126,7 @@ class BaseAgent:
             temperature=self.config.temperature,
             api_key=self.api_key,
             mode=llm_mode,
+            usage_recorder=usage_recorder,
         )
         self.logger = logging.getLogger(f"wanxiang.agent.{config.name}")
 

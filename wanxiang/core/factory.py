@@ -34,6 +34,7 @@ class AgentFactory:
         tool_registry: ToolRegistry | None = None,
         llm_mode: str | None = None,
         skill_forge: Any = None,
+        usage_recorder: Any = None,
     ) -> None:
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         self.model = model
@@ -42,6 +43,7 @@ class AgentFactory:
         self.tool_registry = tool_registry
         self.llm_mode = llm_mode
         self.skill_forge = skill_forge
+        self.usage_recorder = usage_recorder
         self.synthesis_log: list[dict[str, Any]] = []
         self.client = LLMClient(
             model=self.model,
@@ -49,6 +51,7 @@ class AgentFactory:
             temperature=self.temperature,
             api_key=self.api_key,
             mode=self.llm_mode,
+            usage_recorder=usage_recorder,
         )
         self.logger = logging.getLogger("wanxiang.factory")
         self.policies = PlanningPolicies(
@@ -222,6 +225,7 @@ class AgentFactory:
                 tool_registry=self.tool_registry,
                 on_tool_event=on_tool_event,
                 llm_mode=self.llm_mode,
+                usage_recorder=self.usage_recorder,
             )
         return team
 

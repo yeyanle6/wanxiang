@@ -97,7 +97,8 @@ class TestBaseAgentInterface:
             "api_key: 'str | None' = None, "
             "tool_registry: 'ToolRegistry | None' = None, "
             "on_tool_event: 'ToolEventCallback | None' = None, "
-            "llm_mode: 'str | None' = None) -> 'None'"
+            "llm_mode: 'str | None' = None, "
+            "usage_recorder: 'Any' = None) -> 'None'"
         )
 
     def test_base_agent_execute_signature(self):

@@ -6,7 +6,14 @@ import logging
 import os
 import shutil
 import tempfile
-from typing import Any
+from typing import Any, Callable
+
+# Called after every successful generate_response with
+# (input_tokens, output_tokens, mode). `mode` is 'api' or 'cli'.
+# API mode delivers exact counts from the Anthropic response's `usage`
+# field; CLI mode estimates via character count (mode still reported
+# accurately so the budget layer can decide whether to trust the number).
+UsageRecorder = Callable[[int, int, str], None]
 
 DEFAULT_MODEL = "claude-sonnet-4-20250514"
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
@@ -80,6 +87,7 @@ class LLMClient:
         mode: str | None = None,
         llm_call_timeout_s: float = DEFAULT_LLM_CALL_TIMEOUT_S,
         timeout_retry_waits_s: tuple[float, ...] = DEFAULT_TIMEOUT_RETRY_WAITS_S,
+        usage_recorder: UsageRecorder | None = None,
     ) -> None:
         self.model = model
         self.max_tokens = max_tokens
@@ -98,6 +106,7 @@ class LLMClient:
         self.mode = resolved_mode
         self.llm_call_timeout_s = llm_call_timeout_s
         self.timeout_retry_waits_s = tuple(timeout_retry_waits_s)
+        self.usage_recorder = usage_recorder
         self._claude_bin = shutil.which("claude")
         self._cli_auth_cache: bool | None = None
         self.logger = logging.getLogger("wanxiang.llm_client")
@@ -125,12 +134,14 @@ class LLMClient:
 
         for attempt_index in range(max_attempts):
             try:
-                return await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     self._dispatch_generate_response(
                         mode=mode, messages=messages, system=system, tools=tools
                     ),
                     timeout=self.llm_call_timeout_s,
                 )
+                self._record_usage(mode=mode, messages=messages, system=system, result=result)
+                return result
             except asyncio.TimeoutError as exc:
                 last_exc = exc
                 if attempt_index < len(self.timeout_retry_waits_s):
@@ -185,6 +196,35 @@ class LLMClient:
             "stop_reason": "end_turn",
             "content": [{"type": "text", "text": text}],
         }
+
+    def _record_usage(
+        self,
+        *,
+        mode: str,
+        messages: list[dict[str, Any]],
+        system: str | None,
+        result: dict[str, Any],
+    ) -> None:
+        """Pump token usage to the recorder callback if one is set.
+
+        API responses carry exact usage in result["usage"]; CLI responses
+        don't (the CLI doesn't surface token counts through plain text
+        output), so we estimate via character count. The budget layer
+        treats estimates as conservative upper bounds.
+        """
+        if self.usage_recorder is None:
+            return
+        usage = result.get("usage") if isinstance(result, dict) else None
+        if isinstance(usage, dict) and "input_tokens" in usage:
+            input_tokens = int(usage.get("input_tokens") or 0)
+            output_tokens = int(usage.get("output_tokens") or 0)
+        else:
+            input_tokens = _estimate_tokens_from_messages(messages, system)
+            output_tokens = _estimate_tokens_from_response(result)
+        try:
+            self.usage_recorder(input_tokens, output_tokens, mode)
+        except Exception:
+            self.logger.exception("usage_recorder raised; ignoring")
 
     async def resolve_mode(self, *, require_tools: bool = False) -> str:
         if self.mode == "api":
@@ -408,3 +448,43 @@ class LLMClient:
             lines.append(f"{role}:\n{content_text}")
 
         return "\n\n".join(lines).strip()
+
+
+# ---------------------------------------------------------------------------
+# Token estimation helpers (CLI mode only — API mode gets exact counts).
+# Rule of thumb: ~4 chars per token for English, ~1.5 for Chinese. Using 3
+# is a conservative middle ground (overestimates slightly, which is the
+# right bias for budget gating).
+# ---------------------------------------------------------------------------
+
+_CHARS_PER_TOKEN_ESTIMATE = 3
+
+
+def _count_chars(value: Any) -> int:
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, dict):
+        return len(str(value.get("text", value.get("content", ""))))
+    if isinstance(value, list):
+        return sum(_count_chars(item) for item in value)
+    return 0
+
+
+def _estimate_tokens_from_messages(
+    messages: list[dict[str, Any]], system: str | None
+) -> int:
+    chars = len(system or "")
+    for message in messages:
+        if isinstance(message, dict):
+            chars += _count_chars(message.get("content", ""))
+    return max(1, chars // _CHARS_PER_TOKEN_ESTIMATE)
+
+
+def _estimate_tokens_from_response(result: dict[str, Any]) -> int:
+    if not isinstance(result, dict):
+        return 0
+    chars = 0
+    for block in result.get("content", []) or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            chars += len(str(block.get("text", "")))
+    return max(1, chars // _CHARS_PER_TOKEN_ESTIMATE) if chars else 0
