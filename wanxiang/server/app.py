@@ -14,10 +14,14 @@ from datetime import datetime
 
 from ..core.agent import AgentConfig, BaseAgent
 from ..core.builtin_tools import create_default_registry
+from ..core.autoschool import Autoschool
+from ..core.curriculum import commit_tasks, generate_l0_tasks
 from ..core.gap_detector import detect_synthesis_candidates
+from ..core.growth_budget import GrowthBudget
 from ..core.mcp_loader import MCPPool, load_mcp_declarations
 from ..core.outcome_tagger import tag_run
 from ..core.sandbox import SandboxExecutor
+from ..core.seed_loader import enqueue_seed_tasks
 from ..core.skill_forge import SkillForge
 from ..core.skill_loader import approve_skill, list_skills, load_approved_skills
 from ..core.storage import Storage
@@ -52,11 +56,13 @@ SKILL_SYNTHESIZER_YAML = (
 SKILLS_DIR = Path(__file__).resolve().parents[2] / "skills"
 STORAGE_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "wanxiang.db"
 RUNS_JSONL_PATH = Path(__file__).resolve().parents[2] / "data" / "runs.jsonl"
+SEED_TASKS_YAML = Path(__file__).resolve().parents[2] / "configs" / "seed_tasks.yaml"
 
 _run_manager: RunManager | None = None
 _mcp_pool: MCPPool | None = None
 _skill_forge: SkillForge | None = None
 _storage: Storage | None = None
+_autoschool: Autoschool | None = None
 
 
 def _get_run_manager() -> RunManager:
@@ -67,7 +73,7 @@ def _get_run_manager() -> RunManager:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    global _run_manager, _mcp_pool, _skill_forge, _storage
+    global _run_manager, _mcp_pool, _skill_forge, _storage, _autoschool
     tool_registry = create_default_registry()
     _mcp_pool = MCPPool()
 
@@ -119,17 +125,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         skills_dir=SKILLS_DIR,
     )
 
+    budget: GrowthBudget | None = None
+    usage_recorder = None
+    if _storage is not None:
+        budget = GrowthBudget(_storage)
+        usage_recorder = budget.record_usage
+
     _run_manager = RunManager(
         llm_mode=llm_mode,
         tool_registry=tool_registry,
         skill_forge=_skill_forge,
         tier_manager=tier_manager,
         storage=_storage,
+        usage_recorder=usage_recorder,
     )
+
+    if _storage is not None and budget is not None and _autoschool_enabled():
+        _bootstrap_curriculum(_storage, tool_registry)
+        _autoschool = _build_autoschool(_storage, _run_manager, budget)
+        if _autoschool is not None:
+            await _autoschool.start()
 
     try:
         yield
     finally:
+        if _autoschool is not None:
+            try:
+                await _autoschool.stop()
+            except Exception:
+                logger.exception("autoschool stop failed")
         if _mcp_pool is not None:
             await _mcp_pool.close()
         if _storage is not None:
@@ -138,11 +162,58 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _mcp_pool = None
         _skill_forge = None
         _storage = None
+        _autoschool = None
 
 
 def _storage_enabled() -> bool:
     flag = os.getenv("WANXIANG_STORAGE_DUAL_WRITE", "").strip().lower()
     return flag in {"1", "true", "yes", "on"}
+
+
+def _autoschool_enabled() -> bool:
+    flag = os.getenv("WANXIANG_AUTOSCHOOL_ENABLED", "").strip().lower()
+    return flag in {"1", "true", "yes", "on"}
+
+
+def _bootstrap_curriculum(storage: Storage, tool_registry) -> None:
+    """Fill curriculum_queue from seed YAML + L0 template generator.
+
+    Both operations are idempotent (enqueue_task_if_new dedups by
+    (task, source)), so this is safe to call every startup — it only
+    adds new tasks when the seed file grows or new tools register.
+    """
+    try:
+        seed_added = enqueue_seed_tasks(storage, SEED_TASKS_YAML)
+        if seed_added:
+            logger.info("Autoschool: enqueued %d new seed task(s)", seed_added)
+    except Exception:
+        logger.exception("Autoschool: seed_loader failed; continuing")
+    try:
+        l0_added = commit_tasks(
+            storage, generate_l0_tasks(tool_registry), source="l0_generator"
+        )
+        if l0_added:
+            logger.info("Autoschool: enqueued %d new L0 task(s)", l0_added)
+    except Exception:
+        logger.exception("Autoschool: L0 generator failed; continuing")
+
+
+def _build_autoschool(
+    storage: Storage, run_manager: RunManager, budget: GrowthBudget
+) -> Autoschool | None:
+    try:
+        tick_s = float(os.getenv("WANXIANG_AUTOSCHOOL_TICK_S", "60"))
+        max_concurrent = int(os.getenv("WANXIANG_AUTOSCHOOL_MAX_CONCURRENT", "1"))
+    except ValueError:
+        logger.exception("Autoschool: invalid env config; disabling")
+        return None
+    return Autoschool(
+        storage=storage,
+        run_manager=run_manager,
+        budget=budget,
+        tick_interval_s=tick_s,
+        max_concurrent=max_concurrent,
+    )
 
 
 def _should_bootstrap_storage(storage: Storage) -> bool:
