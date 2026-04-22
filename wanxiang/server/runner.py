@@ -48,6 +48,7 @@ class RunManager:
         skill_forge: Any = None,
         tier_manager: TierManager | None = None,
         storage: Storage | None = None,
+        usage_recorder: Any = None,
     ) -> None:
         if factory is not None:
             self.factory = factory
@@ -61,6 +62,7 @@ class RunManager:
                 tool_registry=registry,
                 llm_mode=llm_mode,
                 skill_forge=skill_forge,
+                usage_recorder=usage_recorder,
             )
         self.tier_manager = tier_manager if tier_manager is not None else TierManager()
         self.storage = storage
@@ -134,6 +136,23 @@ class RunManager:
             self._runs[run_id] = state
             state.task = asyncio.create_task(self._execute_run(run_id, cleaned_task))
         return run_id
+
+    async def wait_for_run(self, run_id: str) -> None:
+        """Await a dispatched run's completion. No-op if run unknown.
+
+        Autoschool calls this to track fire-and-forget dispatches so it
+        can mark curriculum_queue rows 'done' once the run lands in
+        storage. Exceptions from the run task are swallowed — persistence
+        already logged them, and propagating here would kill the
+        autoschool loop.
+        """
+        state = self._runs.get(run_id)
+        if state is None or state.task is None:
+            return
+        try:
+            await state.task
+        except Exception:
+            self._logger.exception("wait_for_run: run %s raised", run_id)
 
     async def stream_events(self, run_id: str):
         state = self._runs.get(run_id)
