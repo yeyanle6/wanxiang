@@ -398,6 +398,42 @@ class Storage:
             )
             return int(cursor.lastrowid)
 
+    def enqueue_task_if_new(
+        self,
+        *,
+        level: int,
+        task: str,
+        source: str,
+        expected_outcome_keywords: list[str] | None = None,
+    ) -> int | None:
+        """Enqueue unless (task, source) already exists. Returns new id or None.
+
+        Dedup key is the pair (task_text, source). Seed-loader reruns therefore
+        stay idempotent even after the DB has accumulated running/done rows
+        for the same tasks — we match on text, not on status.
+        """
+        with self._tx() as c:
+            existing = c.execute(
+                "SELECT id FROM curriculum_queue WHERE task = ? AND source = ? LIMIT 1",
+                (task, source),
+            ).fetchone()
+            if existing is not None:
+                return None
+            keywords_json = (
+                json.dumps(expected_outcome_keywords, ensure_ascii=False)
+                if expected_outcome_keywords
+                else None
+            )
+            cursor = c.execute(
+                """
+                INSERT INTO curriculum_queue
+                    (level, task, source, expected_outcome_keywords, status)
+                VALUES (?, ?, ?, ?, 'pending')
+                """,
+                (level, task, source, keywords_json),
+            )
+            return int(cursor.lastrowid)
+
     def claim_next_task(self, *, level: int | None = None) -> dict[str, Any] | None:
         sql = "SELECT * FROM curriculum_queue WHERE status = 'pending'"
         params: list[Any] = []
