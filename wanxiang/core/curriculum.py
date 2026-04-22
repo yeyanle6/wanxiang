@@ -50,7 +50,7 @@ def generate_l0_tasks(registry: ToolRegistry) -> list[dict[str, Any]]:
         tasks.append(
             {
                 "level": 0,
-                "task": f"用一句话描述工具 '{name}' 的用途。",
+                "task": f"Describe the purpose of the tool '{name}' in one sentence.",
                 "source_id": f"l0_describe_{name}",
                 "expected_outcome_keywords": [name],
             }
@@ -58,9 +58,9 @@ def generate_l0_tasks(registry: ToolRegistry) -> list[dict[str, Any]]:
         tasks.append(
             {
                 "level": 0,
-                "task": f"说明工具 '{name}' 接受哪些参数,以及这些参数的含义。",
+                "task": f"Explain what parameters the tool '{name}' accepts and what each one means.",
                 "source_id": f"l0_params_{name}",
-                "expected_outcome_keywords": [name, "参数"],
+                "expected_outcome_keywords": [name, "parameter"],
             }
         )
     return tasks
