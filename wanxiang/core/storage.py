@@ -29,7 +29,7 @@ from typing import Any, Iterable, Iterator
 
 logger = logging.getLogger("wanxiang.storage")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -103,7 +103,113 @@ CREATE TABLE IF NOT EXISTS curriculum_queue (
 );
 
 CREATE INDEX IF NOT EXISTS idx_curriculum_status ON curriculum_queue(status, level);
+
+CREATE TABLE IF NOT EXISTS projects (
+    project_id    TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    slug          TEXT NOT NULL,
+    user_goal     TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'elicit',
+    blocked_on    TEXT,
+    workspace_dir TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_slug ON projects(slug);
+
+CREATE TABLE IF NOT EXISTS conversations (
+    conversation_id TEXT PRIMARY KEY,
+    project_id      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'open',
+    started_at      TEXT NOT NULL,
+    last_turn_at    TEXT NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_conv_project ON conversations(project_id);
+CREATE INDEX IF NOT EXISTS idx_conv_status  ON conversations(status);
+
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    turn_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    speaker         TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    run_id          TEXT,
+    created_at      TEXT NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_turns_conv ON conversation_turns(conversation_id, seq);
 """
+
+
+@dataclass
+class ProjectRecord:
+    project_id: str
+    name: str
+    slug: str
+    user_goal: str
+    workspace_dir: str
+    status: str = "elicit"
+    blocked_on: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "project_id": self.project_id,
+            "name": self.name,
+            "slug": self.slug,
+            "user_goal": self.user_goal,
+            "workspace_dir": self.workspace_dir,
+            "status": self.status,
+            "blocked_on": self.blocked_on,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass
+class ConversationRecord:
+    conversation_id: str
+    project_id: str
+    status: str = "open"
+    started_at: str = ""
+    last_turn_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "conversation_id": self.conversation_id,
+            "project_id": self.project_id,
+            "status": self.status,
+            "started_at": self.started_at,
+            "last_turn_at": self.last_turn_at,
+        }
+
+
+@dataclass
+class ConversationTurn:
+    turn_id: int
+    conversation_id: str
+    seq: int
+    speaker: str
+    content: str
+    created_at: str
+    run_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "turn_id": self.turn_id,
+            "conversation_id": self.conversation_id,
+            "seq": self.seq,
+            "speaker": self.speaker,
+            "content": self.content,
+            "run_id": self.run_id,
+            "created_at": self.created_at,
+        }
 
 
 @dataclass
@@ -206,6 +312,11 @@ class Storage:
             ):
                 if col_sql[0] not in existing_columns:
                     self._conn.execute(col_sql[1])
+
+        # v3: projects / conversations / conversation_turns. Pure-additive —
+        # _SCHEMA_SQL's CREATE TABLE IF NOT EXISTS already handled it. No
+        # explicit ALTER required; this branch is for discoverability only.
+        # if current < 3: pass
 
     def close(self) -> None:
         with self._lock:
@@ -520,6 +631,209 @@ class Storage:
             rows = self._conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
+    # ---- Projects -----------------------------------------------------------
+
+    def create_project(
+        self,
+        *,
+        project_id: str,
+        name: str,
+        slug: str,
+        user_goal: str,
+        workspace_dir: str,
+        status: str = "elicit",
+    ) -> ProjectRecord:
+        now = _utcnow()
+        with self._tx() as c:
+            c.execute(
+                """
+                INSERT INTO projects
+                    (project_id, name, slug, user_goal, status, workspace_dir, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (project_id, name, slug, user_goal, status, workspace_dir, now, now),
+            )
+        return ProjectRecord(
+            project_id=project_id,
+            name=name,
+            slug=slug,
+            user_goal=user_goal,
+            workspace_dir=workspace_dir,
+            status=status,
+            created_at=now,
+            updated_at=now,
+        )
+
+    def get_project(self, project_id: str) -> ProjectRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+        return _row_to_project(row) if row else None
+
+    def get_project_by_slug(self, slug: str) -> ProjectRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM projects WHERE slug = ?", (slug,)
+            ).fetchone()
+        return _row_to_project(row) if row else None
+
+    def list_projects(
+        self, *, status: str | None = None, limit: int = 50
+    ) -> list[ProjectRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(max(1, int(limit)))
+        sql = f"SELECT * FROM projects {where} ORDER BY updated_at DESC LIMIT ?"
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_project(r) for r in rows]
+
+    def update_project_status(
+        self,
+        project_id: str,
+        *,
+        status: str | None = None,
+        blocked_on: str | None = None,
+    ) -> None:
+        if status is None and blocked_on is None:
+            return
+        sets: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            sets.append("status = ?")
+            params.append(status)
+        # blocked_on cleared when explicitly set to empty string.
+        if blocked_on is not None:
+            sets.append("blocked_on = ?")
+            params.append(blocked_on or None)
+        sets.append("updated_at = ?")
+        params.append(_utcnow())
+        params.append(project_id)
+        with self._tx() as c:
+            c.execute(
+                f"UPDATE projects SET {', '.join(sets)} WHERE project_id = ?",
+                params,
+            )
+
+    # ---- Conversations ------------------------------------------------------
+
+    def create_conversation(
+        self,
+        *,
+        conversation_id: str,
+        project_id: str,
+        status: str = "open",
+    ) -> ConversationRecord:
+        now = _utcnow()
+        with self._tx() as c:
+            c.execute(
+                """
+                INSERT INTO conversations
+                    (conversation_id, project_id, status, started_at, last_turn_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (conversation_id, project_id, status, now, now),
+            )
+        return ConversationRecord(
+            conversation_id=conversation_id,
+            project_id=project_id,
+            status=status,
+            started_at=now,
+            last_turn_at=now,
+        )
+
+    def get_conversation(self, conversation_id: str) -> ConversationRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+        return _row_to_conversation(row) if row else None
+
+    def list_conversations(
+        self, *, project_id: str | None = None, limit: int = 50
+    ) -> list[ConversationRecord]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(max(1, int(limit)))
+        sql = f"SELECT * FROM conversations {where} ORDER BY last_turn_at DESC LIMIT ?"
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [_row_to_conversation(r) for r in rows]
+
+    def update_conversation_status(self, conversation_id: str, status: str) -> None:
+        with self._tx() as c:
+            c.execute(
+                "UPDATE conversations SET status = ?, last_turn_at = ? WHERE conversation_id = ?",
+                (status, _utcnow(), conversation_id),
+            )
+
+    def touch_conversation(self, conversation_id: str) -> None:
+        """Bump last_turn_at without changing status."""
+        with self._tx() as c:
+            c.execute(
+                "UPDATE conversations SET last_turn_at = ? WHERE conversation_id = ?",
+                (_utcnow(), conversation_id),
+            )
+
+    def append_conversation_turn(
+        self,
+        *,
+        conversation_id: str,
+        speaker: str,
+        content: str,
+        run_id: str | None = None,
+    ) -> ConversationTurn:
+        now = _utcnow()
+        with self._tx() as c:
+            seq_row = c.execute(
+                "SELECT COALESCE(MAX(seq), -1) + 1 AS next_seq "
+                "FROM conversation_turns WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            seq = int(seq_row["next_seq"])
+            cursor = c.execute(
+                """
+                INSERT INTO conversation_turns
+                    (conversation_id, seq, speaker, content, run_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (conversation_id, seq, speaker, content, run_id, now),
+            )
+            c.execute(
+                "UPDATE conversations SET last_turn_at = ? WHERE conversation_id = ?",
+                (now, conversation_id),
+            )
+            return ConversationTurn(
+                turn_id=int(cursor.lastrowid),
+                conversation_id=conversation_id,
+                seq=seq,
+                speaker=speaker,
+                content=content,
+                run_id=run_id,
+                created_at=now,
+            )
+
+    def list_conversation_turns(
+        self, conversation_id: str, *, limit: int = 500
+    ) -> list[ConversationTurn]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM conversation_turns WHERE conversation_id = ? "
+                "ORDER BY seq ASC LIMIT ?",
+                (conversation_id, max(1, int(limit))),
+            ).fetchall()
+        return [_row_to_turn(r) for r in rows]
+
     # ---- Import / migration -------------------------------------------------
 
     def import_jsonl(self, jsonl_path: Path) -> int:
@@ -581,4 +895,40 @@ def _row_to_run(row: sqlite3.Row) -> RunRecord:
         graded_pass=None if graded is None else bool(graded),
         grade_reason=row["grade_reason"],
         graded_at=row["graded_at"],
+    )
+
+
+def _row_to_project(row: sqlite3.Row) -> ProjectRecord:
+    return ProjectRecord(
+        project_id=row["project_id"],
+        name=row["name"],
+        slug=row["slug"],
+        user_goal=row["user_goal"],
+        status=row["status"],
+        blocked_on=row["blocked_on"],
+        workspace_dir=row["workspace_dir"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_conversation(row: sqlite3.Row) -> ConversationRecord:
+    return ConversationRecord(
+        conversation_id=row["conversation_id"],
+        project_id=row["project_id"],
+        status=row["status"],
+        started_at=row["started_at"],
+        last_turn_at=row["last_turn_at"],
+    )
+
+
+def _row_to_turn(row: sqlite3.Row) -> ConversationTurn:
+    return ConversationTurn(
+        turn_id=row["turn_id"],
+        conversation_id=row["conversation_id"],
+        seq=row["seq"],
+        speaker=row["speaker"],
+        content=row["content"],
+        run_id=row["run_id"],
+        created_at=row["created_at"],
     )

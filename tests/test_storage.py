@@ -51,7 +51,7 @@ class TestSchema:
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()
         assert row is not None
-        assert row["value"] == "2"
+        assert row["value"] == "3"
 
     def test_schema1_db_migrates_to_schema2(self, tmp_path):
         # Simulate a DB created at schema 1 (no grade columns), then reopen
@@ -354,3 +354,223 @@ class TestImportJsonl:
     def test_import_nonexistent_file_returns_zero(self, tmp_path):
         store = _make_store(tmp_path)
         assert store.import_jsonl(tmp_path / "missing.jsonl") == 0
+
+
+# ---- Projects / Conversations (schema v3) -------------------------------
+
+
+class TestProjects:
+    def test_create_and_get(self, tmp_path):
+        store = _make_store(tmp_path)
+        rec = store.create_project(
+            project_id="p1",
+            name="md2html",
+            slug="md2html",
+            user_goal="convert markdown to html",
+            workspace_dir=str(tmp_path / "projects" / "md2html"),
+        )
+        assert rec.status == "elicit"
+        got = store.get_run  # sanity: methods exist
+        p = store.get_project("p1")
+        assert p is not None
+        assert p.name == "md2html"
+        assert p.user_goal == "convert markdown to html"
+
+    def test_get_by_slug(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.create_project(
+            project_id="p1", name="X", slug="x", user_goal="g", workspace_dir="/tmp/x"
+        )
+        p = store.get_project_by_slug("x")
+        assert p is not None and p.project_id == "p1"
+
+    def test_duplicate_slug_rejected(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.create_project(
+            project_id="p1", name="A", slug="dup", user_goal="g", workspace_dir="/tmp/a"
+        )
+        import sqlite3
+        with pytest.raises(sqlite3.IntegrityError):
+            store.create_project(
+                project_id="p2", name="B", slug="dup", user_goal="g", workspace_dir="/tmp/b"
+            )
+
+    def test_update_status(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.create_project(
+            project_id="p1", name="X", slug="x", user_goal="g", workspace_dir="/tmp/x"
+        )
+        store.update_project_status("p1", status="planning")
+        assert store.get_project("p1").status == "planning"
+
+    def test_update_status_touches_updated_at(self, tmp_path):
+        store = _make_store(tmp_path)
+        rec = store.create_project(
+            project_id="p1", name="X", slug="x", user_goal="g", workspace_dir="/tmp/x"
+        )
+        original_updated = rec.updated_at
+        # add a tiny gap so timestamps differ
+        import time
+        time.sleep(0.01)
+        store.update_project_status("p1", status="done")
+        assert store.get_project("p1").updated_at != original_updated
+
+    def test_blocked_on_set_and_cleared(self, tmp_path):
+        store = _make_store(tmp_path)
+        store.create_project(
+            project_id="p1", name="X", slug="x", user_goal="g", workspace_dir="/tmp/x"
+        )
+        store.update_project_status("p1", status="blocked", blocked_on="need GitHub token")
+        assert store.get_project("p1").blocked_on == "need GitHub token"
+        store.update_project_status("p1", status="implementing", blocked_on="")
+        assert store.get_project("p1").blocked_on is None
+
+    def test_list_projects_filter_by_status(self, tmp_path):
+        store = _make_store(tmp_path)
+        for i, status in enumerate(["elicit", "planning", "elicit"]):
+            store.create_project(
+                project_id=f"p{i}", name=f"N{i}", slug=f"s{i}",
+                user_goal="g", workspace_dir=f"/tmp/s{i}",
+            )
+            if status != "elicit":
+                store.update_project_status(f"p{i}", status=status)
+        elicit_projects = store.list_projects(status="elicit")
+        assert len(elicit_projects) == 2
+
+
+class TestConversations:
+    def _with_project(self, store) -> str:
+        store.create_project(
+            project_id="p1", name="X", slug="x",
+            user_goal="g", workspace_dir="/tmp/x",
+        )
+        return "p1"
+
+    def test_create_and_get(self, tmp_path):
+        store = _make_store(tmp_path)
+        self._with_project(store)
+        conv = store.create_conversation(conversation_id="c1", project_id="p1")
+        assert conv.status == "open"
+        got = store.get_conversation("c1")
+        assert got is not None
+        assert got.project_id == "p1"
+
+    def test_foreign_key_on_project(self, tmp_path):
+        store = _make_store(tmp_path)
+        import sqlite3
+        with pytest.raises(sqlite3.IntegrityError):
+            store.create_conversation(
+                conversation_id="c1", project_id="missing"
+            )
+
+    def test_append_turns_and_list(self, tmp_path):
+        store = _make_store(tmp_path)
+        self._with_project(store)
+        store.create_conversation(conversation_id="c1", project_id="p1")
+        store.append_conversation_turn(
+            conversation_id="c1", speaker="user", content="hi"
+        )
+        store.append_conversation_turn(
+            conversation_id="c1", speaker="system", content="hello",
+        )
+        turns = store.list_conversation_turns("c1")
+        assert [(t.seq, t.speaker) for t in turns] == [(0, "user"), (1, "system")]
+
+    def test_turn_seq_autoincrements_per_conversation(self, tmp_path):
+        # Two conversations get independent seq counters.
+        store = _make_store(tmp_path)
+        self._with_project(store)
+        store.create_conversation(conversation_id="c1", project_id="p1")
+        store.create_conversation(conversation_id="c2", project_id="p1")
+        store.append_conversation_turn(conversation_id="c1", speaker="user", content="a")
+        store.append_conversation_turn(conversation_id="c2", speaker="user", content="b")
+        store.append_conversation_turn(conversation_id="c1", speaker="system", content="a2")
+        assert [t.seq for t in store.list_conversation_turns("c1")] == [0, 1]
+        assert [t.seq for t in store.list_conversation_turns("c2")] == [0]
+
+    def test_update_status(self, tmp_path):
+        store = _make_store(tmp_path)
+        self._with_project(store)
+        store.create_conversation(conversation_id="c1", project_id="p1")
+        store.update_conversation_status("c1", "awaiting_user")
+        assert store.get_conversation("c1").status == "awaiting_user"
+
+    def test_turn_carries_run_id(self, tmp_path):
+        store = _make_store(tmp_path)
+        self._with_project(store)
+        store.create_conversation(conversation_id="c1", project_id="p1")
+        turn = store.append_conversation_turn(
+            conversation_id="c1",
+            speaker="system",
+            content="result",
+            run_id="run-123",
+        )
+        assert turn.run_id == "run-123"
+
+    def test_list_conversations_by_project(self, tmp_path):
+        store = _make_store(tmp_path)
+        self._with_project(store)
+        store.create_conversation(conversation_id="c1", project_id="p1")
+        store.create_conversation(conversation_id="c2", project_id="p1")
+        found = store.list_conversations(project_id="p1")
+        ids = {c.conversation_id for c in found}
+        assert ids == {"c1", "c2"}
+
+    def test_cascade_delete_on_project(self, tmp_path):
+        store = _make_store(tmp_path)
+        self._with_project(store)
+        store.create_conversation(conversation_id="c1", project_id="p1")
+        store.append_conversation_turn(
+            conversation_id="c1", speaker="user", content="x"
+        )
+        # Cascade delete the project; conversations + turns follow.
+        with store._tx() as c:
+            c.execute("DELETE FROM projects WHERE project_id = 'p1'")
+        assert store.get_conversation("c1") is None
+        assert store.list_conversation_turns("c1") == []
+
+
+class TestSchemaV3Migration:
+    def test_v2_db_migrates_to_v3_without_data_loss(self, tmp_path):
+        # Legacy v2 DB: runs table + meta schema_version=2, no project tables.
+        import sqlite3 as sq
+        db_path = tmp_path / "legacy.db"
+        c = sq.connect(db_path)
+        c.execute(
+            """CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY, task TEXT NOT NULL,
+                started_at TEXT NOT NULL, completed_at TEXT,
+                final_status TEXT, outcome TEXT, level INTEGER,
+                source TEXT NOT NULL DEFAULT 'user',
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                event_count INTEGER NOT NULL DEFAULT 0,
+                tagged_at TEXT, graded_pass INTEGER, grade_reason TEXT,
+                graded_at TEXT
+            )"""
+        )
+        c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        c.execute("INSERT INTO meta VALUES ('schema_version', '2')")
+        c.execute(
+            "INSERT INTO runs (run_id, task, started_at, source) VALUES (?, ?, ?, 'user')",
+            ("legacy", "t", "2026-04-22T00:00:00+00:00"),
+        )
+        c.commit()
+        c.close()
+
+        store = Storage(db_path)
+        try:
+            # Project/Conversation tables must exist after migration.
+            cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(projects)").fetchall()}
+            assert "project_id" in cols
+            assert "workspace_dir" in cols
+            # Legacy data preserved.
+            legacy = store.get_run("legacy")
+            assert legacy is not None and legacy.task == "t"
+            # Can create project in migrated DB.
+            store.create_project(
+                project_id="new", name="N", slug="n",
+                user_goal="g", workspace_dir="/tmp/n",
+            )
+            assert store.get_project("new") is not None
+        finally:
+            store.close()
