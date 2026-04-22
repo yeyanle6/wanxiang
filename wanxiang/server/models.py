@@ -198,3 +198,77 @@ class SkillApproveResponse(BaseModel):
     approved: bool
     registered: bool
     message: str
+
+
+# ---- Projects / Conversations (Phase 1 project coordinator) -----------
+
+
+class ProjectCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, description="Human-readable project name.")
+    user_goal: str = Field(
+        ..., min_length=1,
+        description="Initial user statement of what the project should achieve.",
+    )
+
+
+class ProjectModel(BaseModel):
+    project_id: str
+    name: str
+    slug: str
+    user_goal: str
+    status: str
+    blocked_on: str | None = None
+    workspace_dir: str
+    created_at: str
+    updated_at: str
+
+
+class ProjectListResponse(BaseModel):
+    projects: list[ProjectModel]
+    total: int
+
+
+class ConversationCreateRequest(BaseModel):
+    project_id: str = Field(..., min_length=1)
+    message: str = Field(..., min_length=1, description="First user message.")
+
+
+class ConversationMessageRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+
+
+class ConversationTurnModel(BaseModel):
+    turn_id: int
+    seq: int
+    speaker: str
+    content: str
+    run_id: str | None = None
+    created_at: str
+
+
+class ConversationModel(BaseModel):
+    conversation_id: str
+    project_id: str
+    status: str
+    started_at: str
+    last_turn_at: str
+
+
+class ConversationDetailResponse(BaseModel):
+    conversation: ConversationModel
+    turns: list[ConversationTurnModel]
+
+
+class ConversationTurnResponse(BaseModel):
+    """Returned from POST /api/conversations/{id}/messages.
+
+    next_speaker indicates whether the conversation is waiting on the user
+    (for a clarifying question) or already moved on. run_id is set when
+    the system's response came from an actual agent execution.
+    """
+    conversation_id: str
+    status: str
+    next_speaker: str | None
+    system_response: str
+    run_id: str | None = None
+    clarification: bool = False

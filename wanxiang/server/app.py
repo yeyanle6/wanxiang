@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -15,11 +16,13 @@ from datetime import datetime
 from ..core.agent import AgentConfig, BaseAgent
 from ..core.builtin_tools import create_default_registry
 from ..core.autoschool import Autoschool
+from ..core.conversation import ConversationManager
 from ..core.curriculum import commit_tasks, generate_l0_tasks
 from ..core.gap_detector import detect_synthesis_candidates
 from ..core.growth_budget import GrowthBudget
 from ..core.mcp_loader import MCPPool, load_mcp_declarations
 from ..core.outcome_tagger import tag_run
+from ..core.project import create_project, load_project, update_status
 from ..core.sandbox import SandboxExecutor
 from ..core.seed_loader import enqueue_seed_tasks
 from ..core.skill_forge import SkillForge
@@ -27,12 +30,22 @@ from ..core.skill_loader import approve_skill, list_skills, load_approved_skills
 from ..core.storage import Storage
 from ..core.tier import TierManager
 from ..core.trace_mining import mine_traces
+from ..core.workspace import bootstrap_workspace
 from .mcp_status import probe_mcp_status
 from .models import (
+    ConversationCreateRequest,
+    ConversationDetailResponse,
+    ConversationMessageRequest,
+    ConversationModel,
+    ConversationTurnModel,
+    ConversationTurnResponse,
     ForgeCandidatesResponse,
     ForgeTriggerRequest,
     ForgeTriggerResponse,
     MCPStatusResponse,
+    ProjectCreateRequest,
+    ProjectListResponse,
+    ProjectModel,
     RunDetailResponse,
     RunListResponse,
     RunRequest,
@@ -69,6 +82,18 @@ def _get_run_manager() -> RunManager:
     if _run_manager is None:
         raise HTTPException(status_code=503, detail="Server not yet initialized.")
     return _run_manager
+
+
+def _get_storage() -> Storage:
+    """Project / conversation routes require SQLite storage. Gated behind
+    WANXIANG_STORAGE_DUAL_WRITE — without it, projects have no home.
+    """
+    if _storage is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Storage is not enabled. Set WANXIANG_STORAGE_DUAL_WRITE=1.",
+        )
+    return _storage
 
 
 @asynccontextmanager
@@ -339,6 +364,164 @@ async def ui_script() -> FileResponse:
     if not UI_FILE.exists():
         raise HTTPException(status_code=404, detail=f"UI file not found: {UI_FILE}")
     return FileResponse(UI_FILE, media_type="application/javascript; charset=utf-8")
+
+
+@app.post("/api/projects", response_model=ProjectModel)
+async def create_project_endpoint(request: ProjectCreateRequest) -> ProjectModel:
+    """Create a project, bootstrap its workspace, return the record."""
+    storage = _get_storage()
+    try:
+        record = create_project(
+            storage,
+            name=request.name,
+            user_goal=request.user_goal,
+            workspace_dir="",  # filled in below after slug is known
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Bootstrap the workspace filesystem + venv and update the path in storage.
+    try:
+        workspace_path = await asyncio.to_thread(bootstrap_workspace, record)
+    except Exception as exc:
+        logger.exception("Workspace bootstrap failed for project %s", record.project_id)
+        raise HTTPException(status_code=500, detail=f"Workspace bootstrap failed: {exc}") from exc
+
+    # Persist the real workspace path (update_project_status won't do it, so touch directly).
+    with storage._tx() as c:  # noqa: SLF001 — project-local bookkeeping
+        from ..core.storage import _utcnow
+        c.execute(
+            "UPDATE projects SET workspace_dir = ?, updated_at = ? WHERE project_id = ?",
+            (str(workspace_path), _utcnow(), record.project_id),
+        )
+    refreshed = load_project(storage, record.project_id)
+    assert refreshed is not None
+    return ProjectModel(**refreshed.to_dict())
+
+
+@app.get("/api/projects/{project_id}", response_model=ProjectModel)
+async def get_project_endpoint(project_id: str) -> ProjectModel:
+    storage = _get_storage()
+    record = load_project(storage, project_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
+    return ProjectModel(**record.to_dict())
+
+
+@app.get("/api/projects", response_model=ProjectListResponse)
+async def list_projects_endpoint() -> ProjectListResponse:
+    storage = _get_storage()
+    records = storage.list_projects(limit=100)
+    return ProjectListResponse(
+        projects=[ProjectModel(**r.to_dict()) for r in records],
+        total=len(records),
+    )
+
+
+@app.post("/api/conversations", response_model=ConversationModel)
+async def create_conversation_endpoint(
+    request: ConversationCreateRequest,
+) -> ConversationModel:
+    """Start a new conversation with the initial user message."""
+    storage = _get_storage()
+    if load_project(storage, request.project_id) is None:
+        raise HTTPException(
+            status_code=404, detail=f"Project not found: {request.project_id}"
+        )
+    manager = ConversationManager(storage)
+    try:
+        conv = manager.start(request.project_id, request.message)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ConversationModel(**conv.to_dict())
+
+
+@app.get("/api/conversations/{conversation_id}", response_model=ConversationDetailResponse)
+async def get_conversation_endpoint(conversation_id: str) -> ConversationDetailResponse:
+    storage = _get_storage()
+    manager = ConversationManager(storage)
+    conv = manager.get(conversation_id)
+    if conv is None:
+        raise HTTPException(
+            status_code=404, detail=f"Conversation not found: {conversation_id}"
+        )
+    turns = manager.turns(conversation_id)
+    return ConversationDetailResponse(
+        conversation=ConversationModel(**conv.to_dict()),
+        turns=[ConversationTurnModel(**t.to_dict()) for t in turns],
+    )
+
+
+@app.post(
+    "/api/conversations/{conversation_id}/messages",
+    response_model=ConversationTurnResponse,
+)
+async def post_conversation_message(
+    conversation_id: str, request: ConversationMessageRequest
+) -> ConversationTurnResponse:
+    """Append user message, dispatch probe-mode run, append system reply."""
+    storage = _get_storage()
+    manager = ConversationManager(storage)
+    conv = manager.get(conversation_id)
+    if conv is None:
+        raise HTTPException(
+            status_code=404, detail=f"Conversation not found: {conversation_id}"
+        )
+
+    # 1. Append user turn (may also transition awaiting_user → open).
+    try:
+        manager.append_user_turn(conversation_id, request.message)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # 2. Dispatch a probe-mode run with conversation context for dialogue.
+    rm = _get_run_manager()
+    context = manager.render_context(conversation_id)
+    run_id = await rm.start_run(
+        request.message,
+        probe=True,
+        source="conversation",
+        conversation_id=conversation_id,
+        project_id=conv.project_id,
+        conversation_context=context,
+    )
+
+    # 3. Wait for completion, extract final agent output.
+    await rm.wait_for_run(run_id)
+    run_record = storage.get_run(run_id, with_events=True)
+    system_text = _extract_final_agent_text(run_record.events if run_record else [])
+
+    # 4. Append system turn — detects NEEDS_CLARIFICATION marker automatically.
+    manager.append_system_turn(conversation_id, system_text, run_id=run_id)
+
+    # 5. Return shape for client.
+    updated = manager.get(conversation_id)
+    assert updated is not None
+    return ConversationTurnResponse(
+        conversation_id=conversation_id,
+        status=updated.status,
+        next_speaker=manager.next_speaker(conversation_id),
+        system_response=system_text,
+        run_id=run_id,
+        clarification=ConversationManager.is_clarification(system_text),
+    )
+
+
+def _extract_final_agent_text(events: list[dict[str, Any]]) -> str:
+    """Pull content from the LAST agent_completed event."""
+    last = ""
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") != "agent_completed":
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        content = data.get("content") or data.get("content_preview") or ""
+        if isinstance(content, str) and content.strip():
+            last = content
+    return last
 
 
 @app.post("/api/runs", response_model=RunResponse)

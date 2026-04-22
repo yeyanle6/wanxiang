@@ -37,6 +37,9 @@ class _RunState:
     source: str = "user"
     probe: bool = False
     expected_keywords: list[str] | None = None
+    conversation_id: str | None = None
+    project_id: str | None = None
+    conversation_context: str | None = None
 
 
 class RunManager:
@@ -119,6 +122,9 @@ class RunManager:
         source: str = "user",
         probe: bool = False,
         expected_keywords: list[str] | None = None,
+        conversation_id: str | None = None,
+        project_id: str | None = None,
+        conversation_context: str | None = None,
     ) -> str:
         cleaned_task = task.strip()
         if not cleaned_task:
@@ -131,6 +137,9 @@ class RunManager:
             source=source,
             probe=probe,
             expected_keywords=list(expected_keywords) if expected_keywords else None,
+            conversation_id=conversation_id,
+            project_id=project_id,
+            conversation_context=conversation_context,
         )
         async with self._lock:
             self._runs[run_id] = state
@@ -181,7 +190,10 @@ class RunManager:
         try:
             llm_mode_effective = await self._resolve_factory_mode()
             if state is not None and state.probe:
-                plan = await self.factory.create_team_probe(task)
+                plan = await self.factory.create_team_probe(
+                    task,
+                    conversation_context=state.conversation_context,
+                )
             else:
                 plan = await self.factory.create_team(task)
             await self._publish(

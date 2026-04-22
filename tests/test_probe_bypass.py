@@ -57,6 +57,43 @@ class TestCreateTeamProbe:
 
         factory.client.generate.assert_not_called()
 
+
+class TestDialogueMode:
+    """Conversation_context switches the responder into dialogue mode."""
+
+    def test_context_injected_into_base_identity(self, factory):
+        ctx = "user: I want rPPG\nsystem: NEEDS_CLARIFICATION: which algorithm?"
+        plan = asyncio.run(factory.create_team_probe("POS", conversation_context=ctx))
+        responder = plan.agents[0]
+        assert "CONVERSATION HISTORY" in responder.base_identity
+        assert "NEEDS_CLARIFICATION" in responder.base_identity
+        assert "POS" not in responder.base_identity  # task itself not in identity
+        assert "which algorithm?" in responder.base_identity
+
+    def test_rationale_marks_dialogue_mode(self, factory):
+        plan = asyncio.run(factory.create_team_probe("x", conversation_context="user: hi"))
+        assert "dialogue" in plan.rationale.lower()
+
+    def test_no_context_keeps_old_identity(self, factory):
+        plan = asyncio.run(factory.create_team_probe("hi"))
+        responder = plan.agents[0]
+        # Old identity has no CONVERSATION HISTORY block.
+        assert "CONVERSATION HISTORY" not in responder.base_identity
+        # Old identity explicitly says do not ask for clarification.
+        assert "do not ask" in responder.base_identity.lower()
+
+    def test_empty_context_falls_back_to_no_context(self, factory):
+        plan = asyncio.run(factory.create_team_probe("hi", conversation_context="   "))
+        assert "CONVERSATION HISTORY" not in plan.agents[0].base_identity
+
+    def test_still_no_llm_call(self, factory):
+        factory.client = MagicMock()
+        factory.client.generate = AsyncMock()
+        asyncio.run(
+            factory.create_team_probe("x", conversation_context="user: hello")
+        )
+        factory.client.generate.assert_not_called()
+
     def test_responder_has_minimal_identity(self, factory):
         plan = asyncio.run(factory.create_team_probe("hello"))
         agent = plan.agents[0]

@@ -59,7 +59,12 @@ class AgentFactory:
             logger=self.logger,
         )
 
-    async def create_team_probe(self, task: str) -> TeamPlan:
+    async def create_team_probe(
+        self,
+        task: str,
+        *,
+        conversation_context: str | None = None,
+    ) -> TeamPlan:
         """Zero-LLM bypass that returns a hardcoded 1-agent pipeline plan.
 
         For autoschool L0/L1 probe tasks where the review-loop overhead
@@ -67,30 +72,57 @@ class AgentFactory:
         policy layer's reviewer injection entirely — 1 LLM call per run
         instead of the normal 3+.
 
-        Do not expose via the public run API — policies exist for a
-        reason and user-facing tasks should benefit from them.
+        When `conversation_context` is provided (multi-turn dialogue mode),
+        the responder gains a different identity: it can choose to ask a
+        clarifying question by prefixing its reply with NEEDS_CLARIFICATION:
+        and the conversation layer will transition to awaiting_user.
+        Without context, the responder behaves as before (direct answer).
         """
         cleaned_task = task.strip()
         if not cleaned_task:
             raise ValueError("Task must be non-empty.")
 
-        agent = AgentSpec(
-            name="responder",
-            duty="Answer the probe task directly.",
-            base_identity=(
+        ctx = (conversation_context or "").strip()
+        if ctx:
+            base_identity = (
+                "You are a conversational responder in a multi-turn dialogue. "
+                "Prior turns are shown below. Decide whether the user's latest "
+                "message has enough information for you to act, or whether a "
+                "clarifying question is needed.\n\n"
+                "If you need more info, reply with a line that STARTS EXACTLY with "
+                "the literal token 'NEEDS_CLARIFICATION:' followed by your question. "
+                "Example: 'NEEDS_CLARIFICATION: which Python library do you prefer?'\n\n"
+                "If you have enough information, just produce the concise answer. "
+                "Do not invoke tools unless strictly required by the task.\n\n"
+                "--- CONVERSATION HISTORY ---\n"
+                f"{ctx}\n"
+                "--- END HISTORY ---"
+            )
+            rationale = "probe-bypass with conversation context (dialogue mode)"
+        else:
+            base_identity = (
                 "You are a direct responder. Produce the exact requested output "
                 "concisely. Do not ask for clarification. Do not invoke tools "
                 "unless strictly required by the task."
-            ),
+            )
+            rationale = "probe-bypass: Director LLM + policies skipped"
+
+        agent = AgentSpec(
+            name="responder",
+            duty="Answer the probe task directly.",
+            base_identity=base_identity,
         )
         plan = TeamPlan(
             agents=[agent],
             workflow="pipeline",
             execution_order=["responder"],
             max_iterations=1,
-            rationale="probe-bypass: Director LLM + policies skipped",
+            rationale=rationale,
         )
-        self.logger.info("Created probe team (1 agent, pipeline, no reviewer)")
+        self.logger.info(
+            "Created probe team (1 agent, pipeline, %s)",
+            "dialogue mode" if ctx else "no context",
+        )
         return plan
 
     async def create_team(self, task: str) -> TeamPlan:
