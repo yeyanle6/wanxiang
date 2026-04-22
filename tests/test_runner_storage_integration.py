@@ -64,7 +64,7 @@ class TestDualWriteEnabled:
         rm._runs["r1"] = state
         record = _base_record(state)
 
-        rm._write_storage_record(record, None, "user")
+        rm._write_storage_record(record, None, "user", None)
 
         got = tmp_storage.get_run("r1")
         assert got is not None
@@ -86,7 +86,7 @@ class TestDualWriteEnabled:
         state = _fake_state(events, final_status="error")
         rm._runs["r1"] = state
 
-        rm._write_storage_record(_base_record(state), None, "user")
+        rm._write_storage_record(_base_record(state), None, "user", None)
 
         got = tmp_storage.get_run("r1")
         assert got.outcome == OUTCOME_INFRA_ERROR
@@ -97,11 +97,63 @@ class TestDualWriteEnabled:
 
         state = _fake_state([], level=1, source="autoschool")
         rm._runs["r1"] = state
-        rm._write_storage_record(_base_record(state), 1, "autoschool")
+        rm._write_storage_record(_base_record(state), 1, "autoschool", None)
 
         got = tmp_storage.get_run("r1")
         assert got.level == 1
         assert got.source == "autoschool"
+
+
+class TestGradeIntegration:
+    def test_keywords_matched_records_pass(self, tmp_storage, tmp_path):
+        rm = RunManager(storage=tmp_storage)
+        rm._history_path = tmp_path / "runs.jsonl"
+
+        events = [
+            {
+                "type": "agent_completed",
+                "timestamp": "t",
+                "data": {"agent": "responder", "content": "The answer is 42 and roses."},
+            }
+        ]
+        state = _fake_state(events, final_status="success")
+        rm._runs["r1"] = state
+        rm._write_storage_record(_base_record(state), 1, "autoschool", ["42", "roses"])
+
+        got = tmp_storage.get_run("r1")
+        assert got.graded_pass is True
+        assert got.graded_at is not None
+
+    def test_keywords_missing_records_fail(self, tmp_storage, tmp_path):
+        rm = RunManager(storage=tmp_storage)
+        rm._history_path = tmp_path / "runs.jsonl"
+
+        events = [
+            {
+                "type": "agent_completed",
+                "timestamp": "t",
+                "data": {"agent": "responder", "content": "42 only"},
+            }
+        ]
+        state = _fake_state(events, final_status="success")
+        rm._runs["r1"] = state
+        rm._write_storage_record(_base_record(state), 1, "autoschool", ["42", "roses"])
+
+        got = tmp_storage.get_run("r1")
+        assert got.graded_pass is False
+        assert "missing" in (got.grade_reason or "").lower()
+
+    def test_no_keywords_grades_by_outcome(self, tmp_storage, tmp_path):
+        rm = RunManager(storage=tmp_storage)
+        rm._history_path = tmp_path / "runs.jsonl"
+
+        events = [{"type": "run_completed", "timestamp": "t", "data": {"status": "success"}}]
+        state = _fake_state(events, final_status="success")
+        rm._runs["r1"] = state
+        rm._write_storage_record(_base_record(state), None, "user", None)
+
+        got = tmp_storage.get_run("r1")
+        assert got.graded_pass is True
 
 
 class TestDualWriteDisabled:
